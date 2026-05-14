@@ -1,0 +1,9 @@
+# Core dependencies for KYC pipeline
+numpy
+opencv-python-headless
+pytesseract
+pypdfium2
+streamlit
+
+# Optional (if you want full opencv GUI support instead of headless)
+# opencv-python

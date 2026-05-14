@@ -25,7 +25,6 @@ class DocumentPipeline:
         }
 
     def convert_pdf_to_image(self, pdf_path):
-        """Renders the first page of a PDF document into a standard OpenCV image array."""
         pdf = pdfium.PdfDocument(pdf_path)
         page = pdf[0]
         pil_image = page.render(scale=4).to_pil()
@@ -33,7 +32,6 @@ class DocumentPipeline:
         return open_cv_image
 
     def load_document_image(self, file_path):
-        """Standardizes inputs by loading standard image types or rasterizing PDFs."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Cannot locate document at: {file_path}")
             
@@ -128,13 +126,14 @@ class DocumentPipeline:
             clean_word = re.sub(r'[\s\-\.\:]', '', word)
             
             if len(clean_word) >= 3 and (clean_word in clean_full_id or any(t in clean_word for t in tokens)):
-                # Avoid drawing a bounding box over the trailing 4 digits on the physical image
+                # Avoid redacting the trailing 4 characters on physical Aadhaar images
                 if clean_full_id[-4:] in clean_word and len(clean_word) <= 5:
                     continue
                 x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
                 cv2.rectangle(masked_img, (x - 2, y - 2), (x + w + 4, y + h + 4), (0, 0, 0), -1)
                 boxes_drawn += 1
 
+        # Save output consistently as JPEG
         base_name = output_path.rsplit('.', 1)[0]
         final_output_path = f"{base_name}.jpg" if output_path.lower().endswith('.pdf') else output_path
         
@@ -146,7 +145,7 @@ class DocumentPipeline:
         actual_doc_type = self.classify_document(text)
         
         result = {
-            "extracted_text": text.strip(), # Passes true raw OCR output unredacted to the local terminal
+            "extracted_text": text.strip(),
             "actual_type": actual_doc_type
         }
 
@@ -154,14 +153,15 @@ class DocumentPipeline:
             id_number = self.verify_and_extract(text, actual_doc_type)
             if id_number:
                 filename = os.path.basename(file_path)
-                masked_image_path = f"masked_{filename}"
+                # Output directly to sample-docs for clean state mapping
+                masked_image_path = f"sample-docs/masked_{filename}"
                 saved_path = self.create_masked_image(thresh_img, oriented_img, id_number, masked_image_path)
                 
                 result.update({
                     "status": "SUCCESS",
                     "message": "Valid ID pattern found and masked.",
-                    "extracted_id": id_number, # Explicitly passes the complete, unmasked ID string
-                    "masked_id": self.mask_id(id_number, actual_doc_type), # Applies secure formatting leaving last 4 digits visible
+                    "extracted_id": id_number,
+                    "masked_id": self.mask_id(id_number, actual_doc_type),
                     "masked_image_file": saved_path or "Bounding box mapping missed; plain text masked successfully."
                 })
             else:

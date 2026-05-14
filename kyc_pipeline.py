@@ -1,21 +1,21 @@
+import os
 import re
 import cv2
+import numpy as np
+import pypdfium2 as pdfium
 import pytesseract
 from pytesseract import Output
 
 class DocumentPipeline:
     def __init__(self):
-        # Updated regex patterns to accommodate OCR character confusion (e.g., reading 0 as O)
         self.patterns = {
             "PAN": r'[A-Z]{5}[0-9]{4}[A-Z]{1}\b',
             "AADHAAR": r'\b\d{4}[\s\-\.]?\d{4}[\s\-\.]?\d{4}\b',
             "VOTER_ID": r'[A-Z]{3}[\s\-\.\:]*[0-9]{7}\b',
             "PASSPORT": r'[A-Z]{1,2}[\s\-\.\:]*[0-9]{6,7}\b',
-            # Allows alphanumeric variations in the RTO code block to catch outputs like MMO3 or MHO3
             "DRIVING_LICENSE": r'[A-Z]{2}[A-Z0-9]{2}[\s\-\.\:]*[0-9]{7,11}\b'
         }
         
-        # Strictly unique keywords stripped of generic terms (like Male/Female/Govt) to prevent misclassification
         self.keywords = {
             "PAN": ["INCOME TAX", "PERMANENT ACCOUNT", "PAN CARD"],
             "AADHAAR": ["UIDAI", "MERA AADHAAR", "VID :"],
@@ -24,17 +24,36 @@ class DocumentPipeline:
             "DRIVING_LICENSE": ["DRIVING LICENCE", "DRIVING LICENSE", "MOTOR DRIVING", "AUTHORISATION", "DL NO"]
         }
 
+    def convert_pdf_to_image(self, pdf_path):
+        """Renders the first page of a PDF document into a standard OpenCV image array."""
+        pdf = pdfium.PdfDocument(pdf_path)
+        page = pdf[0]
+        pil_image = page.render(scale=4).to_pil()
+        open_cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        return open_cv_image
+
+    def load_document_image(self, file_path):
+        """Standardizes inputs by loading standard image types or rasterizing PDFs."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Cannot locate document at: {file_path}")
+            
+        ext = file_path.lower().split('.')[-1]
+        if ext == 'pdf':
+            return self.convert_pdf_to_image(file_path)
+        else:
+            img = cv2.imread(file_path)
+            if img is None:
+                raise ValueError(f"Failed to read image data from: {file_path}. File may be corrupted.")
+            return img
+
     def _preprocess_image(self, image):
         scaled = cv2.resize(image, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
         thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
         return scaled, thresh
 
-    def extract_and_orient(self, image_path):
-        original_img = cv2.imread(image_path)
-        if original_img is None:
-            raise FileNotFoundError(f"Cannot load image at {image_path}")
-
+    def extract_and_orient(self, file_path):
+        original_img = self.load_document_image(file_path)
         current_img = original_img.copy()
         
         for angle in [0, 90, 180, 270]:
@@ -85,25 +104,16 @@ class DocumentPipeline:
             return None
         clean_id = re.sub(r'[\s\-\.\:]', '', id_string)
         
-        # Absolute redaction for highly sensitive IDs
         if doc_type == "AADHAAR":
-            return "[Aadhaar Redacted]"
+            return f"[Aadhaar Redacted]-{clean_id[-4:]}"
         elif len(clean_id) > 4:
             return "X" * (len(clean_id) - 4) + clean_id[-4:]
         return "[Redacted]"
-
-    def secure_text_output(self, text):
-        """Redacts sensitive PII patterns directly from the raw console printout."""
-        secure_text = text
-        if re.search(self.patterns["AADHAAR"], secure_text):
-            secure_text = re.sub(self.patterns["AADHAAR"], "[AADHAAR NUMBER REDACTED]", secure_text)
-        return secure_text
 
     def create_masked_image(self, thresh_img, color_img, id_string, output_path):
         if not id_string:
             return None
 
-        # Clean tokens to map against fragmented OCR bounding boxes
         tokens = [t for t in re.split(r'[\s\-\.\:]', id_string) if len(t) >= 2]
         clean_full_id = re.sub(r'[\s\-\.\:]', '', id_string)
         
@@ -117,38 +127,41 @@ class DocumentPipeline:
             word = ocr_data['text'][i].upper()
             clean_word = re.sub(r'[\s\-\.\:]', '', word)
             
-            # Robust match: triggers if word is part of the ID string, catching split strings
             if len(clean_word) >= 3 and (clean_word in clean_full_id or any(t in clean_word for t in tokens)):
+                # Avoid drawing a bounding box over the trailing 4 digits on the physical image
+                if clean_full_id[-4:] in clean_word and len(clean_word) <= 5:
+                    continue
                 x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
                 cv2.rectangle(masked_img, (x - 2, y - 2), (x + w + 4, y + h + 4), (0, 0, 0), -1)
                 boxes_drawn += 1
 
-        cv2.imwrite(output_path, masked_img)
-        return output_path if boxes_drawn > 0 else None
+        base_name = output_path.rsplit('.', 1)[0]
+        final_output_path = f"{base_name}.jpg" if output_path.lower().endswith('.pdf') else output_path
+        
+        cv2.imwrite(final_output_path, masked_img)
+        return final_output_path if boxes_drawn > 0 else None
 
-    def process_and_verify(self, image_path, intended_doc_type):
-        text, oriented_img, thresh_img = self.extract_and_orient(image_path)
+    def process_and_verify(self, file_path, intended_doc_type):
+        text, oriented_img, thresh_img = self.extract_and_orient(file_path)
         actual_doc_type = self.classify_document(text)
         
         result = {
-            "extracted_text": self.secure_text_output(text.strip()),
+            "extracted_text": text.strip(), # Passes true raw OCR output unredacted to the local terminal
             "actual_type": actual_doc_type
         }
 
         if actual_doc_type == intended_doc_type:
             id_number = self.verify_and_extract(text, actual_doc_type)
             if id_number:
-                filename = image_path.split('/')[-1]
-                # Ensure output directory exists or writes locally
+                filename = os.path.basename(file_path)
                 masked_image_path = f"masked_{filename}"
-                
                 saved_path = self.create_masked_image(thresh_img, oriented_img, id_number, masked_image_path)
                 
                 result.update({
                     "status": "SUCCESS",
                     "message": "Valid ID pattern found and masked.",
-                    "extracted_id": id_number if actual_doc_type != "AADHAAR" else "[Redacted]",
-                    "masked_id": self.mask_id(id_number, actual_doc_type),
+                    "extracted_id": id_number, # Explicitly passes the complete, unmasked ID string
+                    "masked_id": self.mask_id(id_number, actual_doc_type), # Applies secure formatting leaving last 4 digits visible
                     "masked_image_file": saved_path or "Bounding box mapping missed; plain text masked successfully."
                 })
             else:

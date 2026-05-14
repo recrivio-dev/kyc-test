@@ -49,13 +49,13 @@ def run_interactive_pipeline():
             continue
             
         intended_code, intended_name = DOC_MAPPING[selection]
-        file_path = input(f"Enter file path for {intended_name}: ").strip()
+        file_path = input(f"Enter file path for {intended_name} (Supports Images & PDFs): ").strip()
         
         if not os.path.isfile(file_path):
             print(f"Error: File '{file_path}' not found. Please recheck your targeted paths.")
             continue
             
-        print(f"\nProcessing {file_path} (Evaluating rotations & bounding boxes)...")
+        print(f"\nProcessing {file_path} (Evaluating document data layers)...")
         try:
             result = pipeline.process_and_verify(file_path, intended_code)
             print_results(result)

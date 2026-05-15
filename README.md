@@ -92,3 +92,157 @@ This project is provided as-is for testing and demonstration purposes.
 ---
 
 If you'd like, I can also add a small example file and a test script that runs the pipeline against it.
+
+---
+
+## Architecture Diagrams (Mermaid)
+
+Below are several diagrams to make the flow and architecture easier to understand: a Data Flow Diagram (DFD), an overall system flow, a sequence diagram for a single document run, a high-level design (HLD) component diagram, and an ER diagram for persisted artifacts.
+
+> Note: GitHub and many Markdown renderers support Mermaid. If your renderer doesn't show the diagrams, you can paste the Mermaid blocks into the online Mermaid Live Editor (https://mermaid.live) to view them.
+
+### 1) Data Flow Diagram (DFD)
+
+```mermaid
+flowchart TD
+	U[User / Operator]
+	U -->|upload file| S(Streamlit UI / CLI)
+	S -->|save temp file| FS[(sample-docs/ storage)]
+	S -->|invoke| P[DocumentPipeline]
+	P --> OCR[pytesseract OCR]
+	P --> PDF[pypdfium2 (if pdf -> rasterize)]
+	P --> CV[OpenCV preprocessing]
+	OCR -->|text| CLF[Classifier & Pattern Matcher]
+	CLF -->|detected type & id| MASK[Masking & Redaction]
+	MASK -->|masked image| FS
+	P -->|result json| S
+	S -->|render| U
+	style FS fill:#f9f,stroke:#333,stroke-width:1px
+	style P fill:#bbf,stroke:#333,stroke-width:1px
+	style OCR fill:#ffd,stroke:#333,stroke-width:1px
+```
+
+Short explanation: The user uploads a document via the Streamlit UI (or CLI). The file is saved to `sample-docs/` and passed to `DocumentPipeline`. PDFs are rasterized using `pypdfium2`. Images are preprocessed by OpenCV. OCR (pytesseract) extracts text used by classifier/pattern matcher. If an ID is found it is physically redacted on the image and saved back to `sample-docs/`. Results are returned to the UI.
+
+### 2) Overall System Flow
+
+```mermaid
+sequenceDiagram
+	participant U as User
+	participant UI as Streamlit/CLI
+	participant FS as FileSystem
+	participant DP as DocumentPipeline
+	participant PDF as pypdfium2
+	participant CV as OpenCV
+	participant OCR as pytesseract
+	participant DB as (optional) Persistence
+
+	U->>UI: Upload file + select doc type
+	UI->>FS: Save temp file
+	UI->>DP: process_and_verify(file, intended_type)
+	DP->>PDF: (if pdf) render first page
+	DP->>CV: preprocess & rotate/orient
+	DP->>OCR: extract text
+	OCR-->>DP: raw text
+	DP->>DP: classify & verify patterns
+	DP->>DP: mask image regions (if ID)
+	DP->>FS: write masked image
+	DP-->>UI: result dict (status, extracted_id, masked image path)
+	UI-->>U: render result
+```
+
+### 3) Sequence (detailed single-request run)
+
+```mermaid
+sequenceDiagram
+	participant User
+	participant Streamlit
+	participant Pipeline
+	participant OCR
+	participant Mask
+
+	User->>Streamlit: Upload `aadhar.jpg`, select "AADHAAR"
+	Streamlit->>Pipeline: process_and_verify(file, "AADHAAR")
+	Pipeline->>Pipeline: load_document_image(file)
+	Pipeline->>Pipeline: extract_and_orient() (rotate, preprocess)
+	Pipeline->>OCR: image_to_string()
+	OCR-->>Pipeline: text
+	Pipeline->>Pipeline: classify_document(text)
+	Pipeline->>Pipeline: verify_and_extract(text, "AADHAAR")
+	Pipeline->>Mask: create_masked_image(...)
+	Mask-->>Pipeline: masked_image_path
+	Pipeline-->>Streamlit: result dict
+	Streamlit-->>User: displays masked image + text
+```
+
+### 4) High-Level Design (HLD) / Component Diagram
+
+```mermaid
+graph LR
+	subgraph UI
+		A[Streamlit app (`app.py`)]
+		B[CLI (`main.py`)]
+	end
+
+	subgraph Core
+		P[DocumentPipeline]
+		CV[OpenCV (preprocess)]
+		OCR[pytesseract]
+		PDF[pypdfium2]
+		CLF[Classifier + Patterns]
+		MASK[Masking module]
+	end
+
+	subgraph Storage
+		FS[(sample-docs/)]
+	end
+
+	A --> P
+	B --> P
+	P --> PDF
+	P --> CV
+	P --> OCR
+	P --> CLF
+	CLF --> MASK
+	MASK --> FS
+	P --> FS
+```
+
+Short HLD note: `DocumentPipeline` orchestrates PDF rendering, image preprocessing, OCR extraction, classification, ID extraction, and masking. The UI layers simply persist an uploaded file and call the pipeline.
+
+### 5) ER Diagram (Artifacts & Metadata)
+
+This project currently uses the filesystem for outputs rather than a database. The ER diagram below models a possible minimal persistence schema if you want to store runs and artifacts in a DB.
+
+```mermaid
+erDiagram
+		RUNS {
+				string run_id PK
+				string filename
+				string intended_type
+				string actual_type
+				string status
+				string extracted_id
+				datetime created_at
+		}
+
+		ARTIFACTS {
+				string artifact_id PK
+				string run_id FK
+				string artifact_type
+				string path
+				string content_type
+		}
+
+		RUNS ||--o{ ARTIFACTS : produces
+```
+
+Explanation: A `RUNS` table stores each pipeline execution (intent, result, extracted id). `ARTIFACTS` stores file outputs (masked images, original upload) linked to runs by `run_id`.
+
+---
+
+If you prefer I can:
+- Export PNGs of each diagram and place them under `docs/` for renderers that don't support Mermaid.
+- Add a small `examples/` image and a test script that runs through `main.py` automatically and writes a sample DB row.
+
+Let me know which follow-ups you want and I'll add them.

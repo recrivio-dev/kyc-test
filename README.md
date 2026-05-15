@@ -105,18 +105,28 @@ Below are several diagrams to make the flow and architecture easier to understan
 
 ```mermaid
 flowchart TD
-	U[User / Operator]
-	U -->|upload file| S(Streamlit UI / CLI)
-	S -->|save temp file| FS[(sample-docs/ storage)]
-	S -->|invoke| P[DocumentPipeline]
-	P --> OCR[pytesseract OCR]
-	P --> PDF[pypdfium2 (if pdf -> rasterize)]
-	P --> CV[OpenCV preprocessing]
-	OCR -->|text| CLF[Classifier & Pattern Matcher]
-	CLF -->|detected type & id| MASK[Masking & Redaction]
+	U[User]
+	S[Streamlit UI or CLI]
+	FS[(sample-docs storage)]
+	P[DocumentPipeline]
+	OCR[pytesseract OCR]
+	PDF[pypdfium2]
+	CV[OpenCV preprocess]
+	CLF[Classifier and Pattern Matcher]
+	MASK[Masking / Redaction]
+
+	U -->|upload file| S
+	S -->|save temp file| FS
+	S -->|invoke pipeline| P
+	P --> OCR
+	P --> PDF
+	P --> CV
+	OCR -->|text| CLF
+	CLF -->|detected type and id| MASK
 	MASK -->|masked image| FS
 	P -->|result json| S
 	S -->|render| U
+
 	style FS fill:#f9f,stroke:#333,stroke-width:1px
 	style P fill:#bbf,stroke:#333,stroke-width:1px
 	style OCR fill:#ffd,stroke:#333,stroke-width:1px
@@ -179,33 +189,33 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-	subgraph UI
-		A[Streamlit app (`app.py`)]
-		B[CLI (`main.py`)]
-	end
+  subgraph UI
+    A[Streamlit app - app.py]
+    B[CLI - main.py]
+  end
 
-	subgraph Core
-		P[DocumentPipeline]
-		CV[OpenCV (preprocess)]
-		OCR[pytesseract]
-		PDF[pypdfium2]
-		CLF[Classifier + Patterns]
-		MASK[Masking module]
-	end
+  subgraph Core
+    P[DocumentPipeline]
+    CV[OpenCV preprocess]
+    OCR[pytesseract]
+    PDF[pypdfium2]
+    CLF[Classifier and Patterns]
+    MASK[Masking module]
+  end
 
-	subgraph Storage
-		FS[(sample-docs/)]
-	end
+  subgraph Storage
+    FS[(sample-docs folder)]
+  end
 
-	A --> P
-	B --> P
-	P --> PDF
-	P --> CV
-	P --> OCR
-	P --> CLF
-	CLF --> MASK
-	MASK --> FS
-	P --> FS
+  A --> P
+  B --> P
+  P --> PDF
+  P --> CV
+  P --> OCR
+  P --> CLF
+  CLF --> MASK
+  MASK --> FS
+  P --> FS
 ```
 
 Short HLD note: `DocumentPipeline` orchestrates PDF rendering, image preprocessing, OCR extraction, classification, ID extraction, and masking. The UI layers simply persist an uploaded file and call the pipeline.

@@ -1,14 +1,32 @@
 ## KYC Verification Pipeline
 
-Small demo pipeline for document classification, verification, OCR extraction and physical redaction.
+Demo pipeline for Indian KYC document classification, verification, OCR extraction and physical redaction (masking).
 
-This repository contains a CLI and Streamlit UI to run the KYC pipeline implemented in `kyc_pipeline.py`.
+Supported document types: **Aadhaar, PAN, Voter ID, Passport, Driving License**.
+
+This repository contains a CLI and a Streamlit UI to run the KYC pipeline implemented in `kyc_pipeline.py`.
 
 ### What is included
-- `kyc_pipeline.py` - main pipeline that loads images/PDFs, runs OCR, classifies documents, extracts IDs, and creates masked images.
-- `main.py` - simple interactive terminal program to run the pipeline.
+- `kyc_pipeline.py` - main `DocumentPipeline`: loads images/PDFs, runs OCR, classifies documents, extracts IDs, and creates masked images.
+- `ocr_engines.py` - OCR engine wrappers: `PaddleOCREngine`, `SuryaOCREngine`, `TesseractOCREngine`, plus the fallback-selection logic.
+- `preprocessing.py` - OpenCV preprocessing: auto-crop, deskew, enhancement, resizing and 90° rotation helpers.
+- `main.py` - interactive terminal program to run the pipeline.
 - `app.py` - Streamlit dashboard for quick uploads and visual results.
-- `sample-docs/` - storage folder used by the app to hold temporary and masked outputs.
+- `sample-docs/` - storage folder for sample inputs and masked outputs (`sample-docs/mask_debug/` holds masking debug overlays).
+
+---
+
+## How it works
+
+The pipeline uses **two OCR engines for two different jobs**:
+
+1. **Text extraction & classification — PaddleOCR (Surya fallback).**
+   PaddleOCR reads the document cleanly. The image is auto-cropped, deskewed, and tried at all four 90° rotations; the orientation with the best OCR text/confidence is kept. If PaddleOCR output is weak (too little text, low confidence, or multilingual), it falls back to SuryaOCR.
+
+2. **Masking / redaction — Tesseract.**
+   PaddleOCR returns *line-level* boxes, which over-redact (large vertical/horizontal black bars). Masking instead uses Tesseract's tight *word-level* boxes. The masking stage is **orientation-robust**: it independently tries all four 90° rotations and masks in the one where Tesseract reads the ID best — so sideways/vertical scans (common with Voter ID cards) are masked correctly. The redacted image is then rotated back to the original orientation before saving.
+
+What gets masked: the sensitive part of the detected ID number is covered with a solid black box. For Aadhaar the first 8 digits are redacted and the last 4 are left visible (`XXXX XXXX 1234`).
 
 ---
 
@@ -17,14 +35,14 @@ This repository contains a CLI and Streamlit UI to run the KYC pipeline implemen
 Prerequisites:
 
 - Python 3.8+ (3.10 recommended)
-- A system Tesseract installation (required by `pytesseract`)
-
-Install Tesseract on macOS (Homebrew):
-
-```bash
-# install homebrew if you don't have it: https://brew.sh/
-brew install tesseract
-```
+- **Tesseract OCR binary** — required for the masking stage.
+  - macOS: `brew install tesseract`
+  - Ubuntu/Debian: `sudo apt install tesseract-ocr`
+  - Verify with `tesseract --version`.
+- OCR engines (installed via `requirements.txt`):
+  - PaddleOCR — primary extraction engine
+  - SuryaOCR — optional extraction fallback
+  - pytesseract — Python binding for the Tesseract masking engine
 
 Create and activate a virtual environment (recommended):
 
@@ -40,16 +58,15 @@ pip install -r requirements.txt
 ```
 
 Notes on packages:
-- `pypdfium2` is used to rasterize PDF pages. If you have trouble installing it, refer to its docs: https://pypdfium2.readthedocs.io/
-- If you prefer CPU-only OpenCV, `opencv-python-headless` is used here to avoid GUI dependencies.
+- `pypdfium2` rasterizes PDF pages. Install docs: https://pypdfium2.readthedocs.io/
+- `opencv-python-headless` is used to avoid GUI dependencies.
+- `paddleocr` is the primary OCR engine and pulls in `paddlepaddle`; install can take a while.
+- `surya-ocr` is the optional extraction fallback.
+- If Tesseract is not installed, masking silently falls back to PaddleOCR (lower quality) — install the binary for best results.
 
 ---
 
 ## Run (Terminal / CLI)
-
-The `main.py` script launches an interactive CLI where you choose a document type and provide a file path.
-
-Example:
 
 ```bash
 python main.py
@@ -60,46 +77,40 @@ Follow the prompts to select the document type and enter the full path to the im
 Hints:
 - Supported input types: `jpg, jpeg, png, webp, pdf`.
 - Output masked images and temporary files are saved under `sample-docs/`.
+- Masking debug overlays (green boxes showing detected regions) are saved under `sample-docs/mask_debug/`.
 
 ---
 
 ## Run (Streamlit UI)
 
-The `app.py` provides a web UI for uploads and visual inspection. Start Streamlit from the repository root:
-
 ```bash
 streamlit run app.py
 ```
 
-This will open a browser window (or give you a local URL) where you can select an intended document type and upload images or PDFs.
+This opens a browser window (or gives a local URL) where you select an intended document type and upload an image or PDF.
 
 UI behavior:
 - Use the left panel to pick a document type and upload the file.
-- Click "Execute KYC Pipeline" to run the pipeline. Results, masked image preview, and raw OCR text will appear on the right.
+- Click "Execute KYC Pipeline" to run. Results, masked image preview, and raw OCR text appear on the right.
 
 ---
 
 ## Troubleshooting / Tips
 
-- If OCR returns no text or unexpected results, try increasing image resolution or using clearer scans.
-- If `pytesseract` cannot be found, ensure `tesseract` binary is installed and accessible on your PATH (try `tesseract --version`).
-- For PDFs with multiple pages the current pipeline only processes the first page.
+- If OCR returns no text or unexpected results, try a higher-resolution or clearer scan.
+- If masking produces no black boxes, ensure the `tesseract` binary is on your PATH (`tesseract --version`).
+- Sideways/vertical scans are handled automatically — the masking stage detects the correct orientation itself.
+- For PDFs with multiple pages, only the first page is processed.
 
 ## License & Attribution
 
-This project is provided as-is for testing and demonstration purposes.
-
----
-
-If you'd like, I can also add a small example file and a test script that runs the pipeline against it.
+Provided as-is for testing and demonstration purposes.
 
 ---
 
 ## Architecture Diagrams (Mermaid)
 
-Below are several diagrams to make the flow and architecture easier to understand: a Data Flow Diagram (DFD), an overall system flow, a sequence diagram for a single document run, a high-level design (HLD) component diagram, and an ER diagram for persisted artifacts.
-
-> Note: GitHub and many Markdown renderers support Mermaid. If your renderer doesn't show the diagrams, you can paste the Mermaid blocks into the online Mermaid Live Editor (https://mermaid.live) to view them.
+Diagrams for the flow and architecture. GitHub and many Markdown renderers support Mermaid; otherwise paste the blocks into https://mermaid.live.
 
 ### 1) Data Flow Diagram (DFD)
 
@@ -109,30 +120,37 @@ flowchart TD
 	S[Streamlit UI or CLI]
 	FS[(sample-docs storage)]
 	P[DocumentPipeline]
-	OCR[pytesseract OCR]
-	PDF[pypdfium2]
-	CV[OpenCV preprocess]
+	PDF[pypdfium2 PDF render]
+	CV[OpenCV preprocess - crop/deskew/rotate]
+	PAD[PaddleOCR - extraction]
+	SUR[SuryaOCR - extraction fallback]
 	CLF[Classifier and Pattern Matcher]
+	TES[Tesseract - masking OCR]
 	MASK[Masking / Redaction]
 
 	U -->|upload file| S
 	S -->|save temp file| FS
 	S -->|invoke pipeline| P
-	P --> OCR
 	P --> PDF
 	P --> CV
-	OCR -->|text| CLF
+	CV --> PAD
+	PAD -.low confidence.-> SUR
+	PAD -->|text| CLF
+	SUR -->|text| CLF
 	CLF -->|detected type and id| MASK
+	MASK --> TES
+	TES -->|word boxes| MASK
 	MASK -->|masked image| FS
 	P -->|result json| S
 	S -->|render| U
 
 	style FS fill:#f9f,stroke:#333,stroke-width:1px
 	style P fill:#bbf,stroke:#333,stroke-width:1px
-	style OCR fill:#ffd,stroke:#333,stroke-width:1px
+	style PAD fill:#ffd,stroke:#333,stroke-width:1px
+	style TES fill:#dfd,stroke:#333,stroke-width:1px
 ```
 
-Short explanation: The user uploads a document via the Streamlit UI (or CLI). The file is saved to `sample-docs/` and passed to `DocumentPipeline`. PDFs are rasterized using `pypdfium2`. Images are preprocessed by OpenCV. OCR (pytesseract) extracts text used by classifier/pattern matcher. If an ID is found it is physically redacted on the image and saved back to `sample-docs/`. Results are returned to the UI.
+Short explanation: The user uploads a document via the Streamlit UI (or CLI). The file is saved to `sample-docs/` and passed to `DocumentPipeline`. PDFs are rasterized with `pypdfium2`; images are cropped/deskewed/rotated by OpenCV. **PaddleOCR** extracts text (falling back to **SuryaOCR** on weak output), which feeds the classifier and pattern matcher. Once an ID is found, the masking stage runs **Tesseract** to get tight word boxes, redacts the sensitive region, and writes the masked image back to `sample-docs/`.
 
 ### 2) Overall System Flow
 
@@ -144,19 +162,21 @@ sequenceDiagram
 	participant DP as DocumentPipeline
 	participant PDF as pypdfium2
 	participant CV as OpenCV
-	participant OCR as pytesseract
-	participant DB as (optional) Persistence
+	participant PAD as PaddleOCR/Surya
+	participant TES as Tesseract
 
 	U->>UI: Upload file + select doc type
 	UI->>FS: Save temp file
 	UI->>DP: process_and_verify(file, intended_type)
 	DP->>PDF: (if pdf) render first page
-	DP->>CV: preprocess & rotate/orient
-	DP->>OCR: extract text
-	OCR-->>DP: raw text
-	DP->>DP: classify & verify patterns
-	DP->>DP: mask image regions (if ID)
-	DP->>FS: write masked image
+	DP->>CV: auto-crop, deskew
+	DP->>PAD: OCR at 0/90/180/270, pick best orientation
+	PAD-->>DP: text + confidence
+	DP->>DP: classify_document & verify_and_extract
+	DP->>TES: create_masked_image - OCR at 4 rotations
+	TES-->>DP: word boxes for best orientation
+	DP->>DP: redact word boxes, rotate back
+	DP->>FS: write masked image (+ debug overlay)
 	DP-->>UI: result dict (status, extracted_id, masked image path)
 	UI-->>U: render result
 ```
@@ -168,20 +188,21 @@ sequenceDiagram
 	participant User
 	participant Streamlit
 	participant Pipeline
-	participant OCR
-	participant Mask
+	participant Paddle as PaddleOCR
+	participant Tess as Tesseract
 
-	User->>Streamlit: Upload `aadhar.jpg`, select "AADHAAR"
+	User->>Streamlit: Upload `aadhaar.jpg`, select "AADHAAR"
 	Streamlit->>Pipeline: process_and_verify(file, "AADHAAR")
 	Pipeline->>Pipeline: load_document_image(file)
-	Pipeline->>Pipeline: extract_and_orient() (rotate, preprocess)
-	Pipeline->>OCR: image_to_string()
-	OCR-->>Pipeline: text
+	Pipeline->>Pipeline: extract_and_orient() - crop, deskew, try 4 rotations
+	Pipeline->>Paddle: OCR each rotation (Surya fallback if weak)
+	Paddle-->>Pipeline: best text + orientation
 	Pipeline->>Pipeline: classify_document(text)
 	Pipeline->>Pipeline: verify_and_extract(text, "AADHAAR")
-	Pipeline->>Mask: create_masked_image(...)
-	Mask-->>Pipeline: masked_image_path
-	Pipeline-->>Streamlit: result dict
+	Pipeline->>Tess: create_masked_image() - OCR at 0/90/180/270
+	Tess-->>Pipeline: word boxes (orientation with most ID hits)
+	Pipeline->>Pipeline: redact boxes, rotate image back
+	Pipeline-->>Streamlit: result dict + masked image path
 	Streamlit-->>User: displays masked image + text
 ```
 
@@ -195,12 +216,17 @@ graph LR
   end
 
   subgraph Core
-    P[DocumentPipeline]
-    CV[OpenCV preprocess]
-    OCR[pytesseract]
+    P[DocumentPipeline - kyc_pipeline.py]
+    CV[preprocessing.py - OpenCV]
     PDF[pypdfium2]
     CLF[Classifier and Patterns]
     MASK[Masking module]
+  end
+
+  subgraph OCR Engines - ocr_engines.py
+    PAD[PaddleOCREngine - extraction]
+    SUR[SuryaOCREngine - fallback]
+    TES[TesseractOCREngine - masking]
   end
 
   subgraph Storage
@@ -211,14 +237,16 @@ graph LR
   B --> P
   P --> PDF
   P --> CV
-  P --> OCR
+  P --> PAD
+  PAD --> SUR
   P --> CLF
   CLF --> MASK
+  MASK --> TES
   MASK --> FS
   P --> FS
 ```
 
-Short HLD note: `DocumentPipeline` orchestrates PDF rendering, image preprocessing, OCR extraction, classification, ID extraction, and masking. The UI layers simply persist an uploaded file and call the pipeline.
+Short HLD note: `DocumentPipeline` orchestrates PDF rendering, image preprocessing, OCR extraction, classification, ID extraction, and masking. Extraction uses PaddleOCR (Surya fallback); masking uses Tesseract for tight word-level boxes. The UI layers simply persist an uploaded file and call the pipeline.
 
 ### 5) ER Diagram (Artifacts & Metadata)
 
@@ -248,11 +276,3 @@ erDiagram
 ```
 
 Explanation: A `RUNS` table stores each pipeline execution (intent, result, extracted id). `ARTIFACTS` stores file outputs (masked images, original upload) linked to runs by `run_id`.
-
----
-
-If you prefer I can:
-- Export PNGs of each diagram and place them under `docs/` for renderers that don't support Mermaid.
-- Add a small `examples/` image and a test script that runs through `main.py` automatically and writes a sample DB row.
-
-Let me know which follow-ups you want and I'll add them.

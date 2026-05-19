@@ -1,9 +1,24 @@
-# Core dependencies for KYC pipeline
-numpy
-opencv-python-headless
-pytesseract
-pypdfium2
-streamlit
+# Core
+numpy==2.2.6
+Pillow==10.4.0
 
-# Optional (if you want full opencv GUI support instead of headless)
-# opencv-python
+opencv-python-headless==4.11.0.86
+pypdfium2==4.30.0
+streamlit==1.48.1
+
+# OCR
+paddlepaddle==3.1.0
+paddleocr==3.2.0
+
+# Surya fallback
+torch==2.8.0
+torchvision==0.23.0
+onnxruntime==1.22.1
+surya-ocr==0.17.0
+
+# Backup OCR
+pytesseract==0.3.13
+
+# Utils
+scipy
+pandas

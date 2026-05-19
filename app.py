@@ -27,6 +27,20 @@ def get_pipeline():
 
 pipeline = get_pipeline()
 
+try:
+    pipeline._ensure_ocr()
+
+    if not pipeline.ocr_available:
+        st.warning(
+            "OCR backend unavailable"
+        )
+
+except Exception as e:
+
+    st.error(
+        f"OCR init failed: {e}"
+    )
+
 # Title Header Section
 st.title("🛡️ Secure KYC Verification Pipeline")
 st.markdown("Automated classification, validation, text parsing, and dynamic physical redaction engine.")
@@ -75,6 +89,12 @@ with col2:
                 
                 if result.get("status") == "SUCCESS":
                     st.success("✅ **Verification Verified Successfully**")
+
+                    # OCR metadata
+                    with st.expander("OCR details"):
+                        st.write(f"Engine: **{result.get('ocr_engine')}**")
+                        st.write(f"Avg confidence: **{result.get('ocr_avg_confidence')}**")
+                        st.write(f"Decision: `{result.get('ocr_decision_reason')}`")
                     
                     # Display structured output parameters cleanly
                     st.metric("Detected Classification", actual_name)
@@ -90,9 +110,38 @@ with col2:
                     st.metric("Detected Classification", actual_name)
                     st.warning(result.get("message"))
 
+                    with st.expander("OCR details"):
+                        st.write(f"Engine: **{result.get('ocr_engine')}**")
+                        st.write(f"Avg confidence: **{result.get('ocr_avg_confidence')}**")
+                        st.write(f"Decision: `{result.get('ocr_decision_reason')}`")
+
             # Provide visibility into the complete raw string output layout logs
             with st.expander("Show Raw OCR Processing Data Log"):
                 st.code(result.get("extracted_text", "[No string content located]"), language="text")
+
+            # Debug preview images for preprocessing stages
+            with st.expander("Debug: preprocessing previews"):
+                try:
+                    dbg = pipeline.build_preprocess_debug(temp_path)
+                    st.caption("Base (cropped + deskewed) image")
+                    st.image(dbg["base_color"], channels="BGR", use_container_width=True)
+
+                    v = dbg.get("variants", {})
+                    cols = st.columns(3)
+                    if "color" in v:
+                        cols[0].caption("Variant: color")
+                        cols[0].image(v["color"], channels="BGR", use_container_width=True)
+                    if "gray" in v:
+                        cols[1].caption("Variant: gray")
+                        cols[1].image(v["gray"], clamp=True, use_container_width=True)
+                    if "bin" in v:
+                        cols[2].caption("Variant: bin")
+                        cols[2].image(v["bin"], clamp=True, use_container_width=True)
+
+                    st.caption("Crop / Deskew debug")
+                    st.json({"crop": dbg.get("crop"), "deskew": dbg.get("deskew")})
+                except Exception as e:
+                    st.warning(f"Could not build debug previews: {e}")
                 
             # Clean up target local file cache cleanly post execution flow
             if os.path.exists(temp_path):

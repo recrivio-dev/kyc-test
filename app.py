@@ -1,3 +1,4 @@
+import asyncio
 import os
 import streamlit as st
 from kyc_pipeline import DocumentPipeline
@@ -81,8 +82,10 @@ with col2:
                 with open(temp_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 
-                # Execute primary parsing classes
-                result = pipeline.process_and_verify(temp_path, intended_type)
+                # Execute primary parsing classes (pipeline is async)
+                result = asyncio.run(
+                    pipeline.process_and_verify(temp_path, intended_type)
+                )
                 
                 # Render payload outcomes visually
                 actual_name = pipeline.get_printable_name(result.get('actual_type'))
@@ -95,6 +98,7 @@ with col2:
                         st.write(f"Engine: **{result.get('ocr_engine')}**")
                         st.write(f"Avg confidence: **{result.get('ocr_avg_confidence')}**")
                         st.write(f"Decision: `{result.get('ocr_decision_reason')}`")
+                        st.write(f"Latency: **{result.get('elapsed_sec')} s**")
                     
                     # Display structured output parameters cleanly
                     st.metric("Detected Classification", actual_name)
@@ -119,27 +123,23 @@ with col2:
             with st.expander("Show Raw OCR Processing Data Log"):
                 st.code(result.get("extracted_text", "[No string content located]"), language="text")
 
-            # Debug preview images for preprocessing stages
-            with st.expander("Debug: preprocessing previews"):
+            # Debug preview images for preprocessing + layout stages
+            with st.expander("Debug: layout detection previews"):
                 try:
                     dbg = pipeline.build_preprocess_debug(temp_path)
-                    st.caption("Base (cropped + deskewed) image")
-                    st.image(dbg["base_color"], channels="BGR", use_container_width=True)
+                    cols = st.columns(2)
+                    cols[0].caption("Base (cropped + deskewed + oriented)")
+                    cols[0].image(dbg["base_color"], channels="BGR",
+                                  use_container_width=True)
+                    cols[1].caption(
+                        f"Located regions: {dbg.get('region_count', 0)}")
+                    cols[1].image(dbg["regions_overlay"], channels="BGR",
+                                  use_container_width=True)
 
-                    v = dbg.get("variants", {})
-                    cols = st.columns(3)
-                    if "color" in v:
-                        cols[0].caption("Variant: color")
-                        cols[0].image(v["color"], channels="BGR", use_container_width=True)
-                    if "gray" in v:
-                        cols[1].caption("Variant: gray")
-                        cols[1].image(v["gray"], clamp=True, use_container_width=True)
-                    if "bin" in v:
-                        cols[2].caption("Variant: bin")
-                        cols[2].image(v["bin"], clamp=True, use_container_width=True)
-
-                    st.caption("Crop / Deskew debug")
-                    st.json({"crop": dbg.get("crop"), "deskew": dbg.get("deskew")})
+                    st.caption("Crop / Deskew / Orientation debug")
+                    st.json({"crop": dbg.get("crop"),
+                             "deskew": dbg.get("deskew"),
+                             "orientation_angle": dbg.get("angle")})
                 except Exception as e:
                     st.warning(f"Could not build debug previews: {e}")
                 

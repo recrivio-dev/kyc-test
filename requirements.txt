@@ -1,23 +1,20 @@
 # Core
 numpy==2.2.6
 Pillow==10.4.0
-
 opencv-python-headless==4.11.0.86
 pypdfium2==4.30.0
 streamlit==1.48.1
 
-# OCR
-paddlepaddle==3.1.0
-paddleocr==3.2.0
+# Primary OCR — PaddleOCR (PP-OCR) models served via ONNX Runtime.
+# No PaddlePaddle, no GPU needed; the ONNX session releases the GIL so
+# asyncio.gather over crops runs concurrently.
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.22.1
 
-# Surya fallback
+# Fallback OCR — invoked only on individual low-confidence crops.
+surya-ocr==0.17.0
 torch==2.8.0
 torchvision==0.23.0
-onnxruntime==1.22.1
-surya-ocr==0.17.0
-
-# Backup OCR
-pytesseract==0.3.13
 
 # Utils
 scipy

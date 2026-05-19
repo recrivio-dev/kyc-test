@@ -1,3 +1,4 @@
+import asyncio
 import os
 from kyc_pipeline import DocumentPipeline
 
@@ -57,7 +58,9 @@ def run_interactive_pipeline():
             
         print(f"\nProcessing {file_path} (Evaluating document data layers)...")
         try:
-            result = pipeline.process_and_verify(file_path, intended_code)
+            result = asyncio.run(
+                pipeline.process_and_verify(file_path, intended_code)
+            )
             print_results(result)
         except Exception as e:
             print(f"Execution Error Encountered: {e}")

@@ -1,14 +1,33 @@
+"""OCR engines for the fast KYC pipeline.
+
+Design:
+  * RapidOCREngine — primary. PaddleOCR's PP-OCR models served through
+    ONNX Runtime (the `rapidocr-onnxruntime` package). No PaddlePaddle,
+    no GPU required. The ONNX session releases the GIL during inference,
+    so concurrent crops dispatched via `asyncio.to_thread` truly overlap.
+  * SuryaOCREngine — fallback. A heavier transformer OCR, invoked ONLY on
+    individual low-confidence crops — never on a full page.
+
+Tesseract has been removed entirely: masking no longer depends on
+word-level text recognition (see layout_detector.py / kyc_pipeline.py).
+"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Any
+from typing import List, Optional, Tuple
+
 import numpy as np
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Result containers
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OCRWordBox:
     text: str
-    bbox: Tuple[int, int, int, int]
+    bbox: Tuple[int, int, int, int]        # (x1, y1, x2, y2)
     confidence: Optional[float] = None
 
 
@@ -21,305 +40,126 @@ class OCRResult:
     decision_reason: Optional[str] = None
 
 
-############################################
-# FALLBACK HEURISTICS
-############################################
-
-def should_fallback_to_surya(
-        txt: str,
-        conf: Optional[float],
-        threshold: float = 0.82
-):
-
-    txt = txt.strip()
-
-    if len(txt) < 10:
-        return "too_little_text"
-
-    if conf is not None and conf < threshold:
-        return "low_confidence"
-
-    non_ascii = sum(ord(c) > 127 for c in txt)
-
-    if len(txt) > 0:
-
-        ratio = non_ascii / len(txt)
-
-        if ratio > 0.10:
-            return "multilingual"
-
-    return None
+def _poly_to_xyxy(poly) -> Tuple[int, int, int, int]:
+    """Collapse any polygon / quad / [x1,y1,x2,y2] into an axis-aligned box."""
+    pts = np.asarray(poly, dtype=float).reshape(-1, 2)
+    x1, y1 = pts.min(axis=0)
+    x2, y2 = pts.max(axis=0)
+    return int(x1), int(y1), int(x2), int(y2)
 
 
-############################################
-# BASE ENGINE
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
+# Base
+# ──────────────────────────────────────────────────────────────────────────────
 
 class OCREngine:
+    name = "base"
 
-    def extract(self, image):
-
+    def extract(self, image) -> OCRResult:
         raise NotImplementedError
 
 
-############################################
-# PADDLE OCR
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
+# Primary — RapidOCR (PaddleOCR models via ONNX Runtime)
+# ──────────────────────────────────────────────────────────────────────────────
 
-class PaddleOCREngine(OCREngine):
+class RapidOCREngine(OCREngine):
 
-    def __init__(self, lang="en"):
+    def __init__(self, lang: str = "en"):
+        from rapidocr_onnxruntime import RapidOCR
 
-        from paddleocr import PaddleOCR
-
-        self.name = "paddleocr"
-
-        self.ocr = PaddleOCR(
-            use_textline_orientation=True,
-            lang=lang
-        )
-
-    def extract(self, image):
-
-        result = self.ocr.predict(image)
-
-        text_lines = []
-        confs = []
-
-        words = []
-
-        for page in result:
-
-            texts = page.get("rec_texts", [])
-
-            scores = page.get("rec_scores", [])
-
-            boxes = page.get("rec_boxes", [])
-
-            for txt, conf, box in zip(
-                    texts,
-                    scores,
-                    boxes
-            ):
-
-                try:
-
-                    x1,y1,x2,y2 = map(
-                        int,
-                        box
-                    )
-
-                except:
-
-                    x1=y1=x2=y2=0
-
-                words.append(
-
-                    OCRWordBox(
-
-                        text=txt,
-
-                        bbox=(
-                            x1,
-                            y1,
-                            x2,
-                            y2
-                        ),
-
-                        confidence=float(conf)
-                    )
-                )
-
-                text_lines.append(txt)
-
-                confs.append(float(conf))
-
-        return OCRResult(
-
-            text="\n".join(text_lines),
-
-            words=words,
-
-            avg_confidence=(
-                sum(confs)/len(confs)
-                if confs else None
-            ),
-
-            engine="paddleocr"
-        )
-
-
-############################################
-# SURYA OCR
-############################################
-
-class SuryaOCREngine(OCREngine):
-
-    def __init__(self, lang="en"):
-
-        self.name = "surya"
-
+        self.name = "rapidocr"
         self.lang = lang
+        # First construction downloads/loads the ONNX models once.
+        self.engine = RapidOCR()
 
-        try:
-
-            from surya.ocr import run_ocr
-
-            self.run = run_ocr
-
-        except:
-
-            self.run = None
-
-    def extract(self,image):
-
-        if self.run is None:
-
-            raise RuntimeError(
-                "Surya not installed"
-            )
-
-        out = self.run(
-            [image],
-            languages=[self.lang]
-        )
-
-        page = out[0]
-
-        text = str(page)
-
-        return OCRResult(
-
-            text=text,
-
-            words=[],
-
-            avg_confidence=None,
-
-            engine="surya"
-        )
-
-
-############################################
-# TESSERACT OCR  (used for masking only)
-############################################
-
-class TesseractOCREngine(OCREngine):
-    """
-    Tesseract gives tight, word-level bounding boxes which makes it a far
-    better fit for redaction/masking than PaddleOCR's line-level boxes.
-    Used exclusively by the masking stage — extraction still uses Paddle.
-    """
-
-    def __init__(self, lang="eng"):
-
-        import pytesseract
-
-        self.pt   = pytesseract
-        self.name = "tesseract"
-        self.lang = lang
-
-    def extract(self, image):
-
-        import cv2
-
-        gray = (
-            cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            if getattr(image, "ndim", 2) == 3
-            else image
-        )
-
-        data = self.pt.image_to_data(
-            gray,
-            lang=self.lang,
-            output_type=self.pt.Output.DICT,
-        )
+    def extract(self, image) -> OCRResult:
+        """Full detect + recognize. On a tiny crop this is effectively a
+        single-line recognition and returns near-instantly."""
+        result, _ = self.engine(image)
 
         words, texts, confs = [], [], []
-
-        for i in range(len(data["text"])):
-
-            txt  = (data["text"][i] or "").strip()
-            conf = float(data["conf"][i])
-
-            if not txt or conf < 0:
-                continue
-
-            x = int(data["left"][i])
-            y = int(data["top"][i])
-            w = int(data["width"][i])
-            h = int(data["height"][i])
-
-            words.append(
-                OCRWordBox(
-                    text=txt,
-                    bbox=(x, y, x + w, y + h),
-                    confidence=conf / 100.0,
-                )
-            )
+        for item in (result or []):
+            box, txt, score = item[0], item[1], float(item[2])
+            words.append(OCRWordBox(txt, _poly_to_xyxy(box), score))
             texts.append(txt)
-            confs.append(conf / 100.0)
+            confs.append(score)
 
         return OCRResult(
-            text=" ".join(texts),
+            text="\n".join(texts),
             words=words,
             avg_confidence=(sum(confs) / len(confs) if confs else None),
-            engine="tesseract",
+            engine="rapidocr",
+        )
+
+    def detect(self, image) -> List[Tuple[int, int, int, int]]:
+        """Detection-only pass — locate text regions without recognising
+        them. This is the cheap 'Locate First' primitive used by the
+        layout detector."""
+        result, _ = self.engine(
+            image, use_det=True, use_cls=False, use_rec=False
+        )
+        return [_poly_to_xyxy(box) for box in (result or [])]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fallback — Surya (low-confidence crops only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SuryaOCREngine(OCREngine):
+    """Surya 0.17 predictor API. Models are heavy, so the predictors are
+    built lazily on first use. Any failure here degrades gracefully — the
+    pipeline simply keeps the primary RapidOCR result for that crop."""
+
+    def __init__(self, lang: str = "en"):
+        self.name = "surya"
+        self.lang = lang
+        self._rec = None
+        self._det = None
+        try:
+            from surya.detection import DetectionPredictor
+            from surya.foundation import FoundationPredictor
+            from surya.recognition import RecognitionPredictor
+
+            self._rec = RecognitionPredictor(FoundationPredictor())
+            self._det = DetectionPredictor()
+        except Exception as e:                       # noqa: BLE001
+            print(f"[WARN] Surya unavailable: {e}")
+
+    def extract(self, image) -> OCRResult:
+        if self._rec is None or self._det is None:
+            raise RuntimeError("Surya not available")
+
+        from PIL import Image
+        if getattr(image, "ndim", 2) == 3:
+            pil = Image.fromarray(image[:, :, ::-1])  # BGR → RGB
+        else:
+            pil = Image.fromarray(image)
+
+        preds = self._rec([pil], det_predictor=self._det)
+        lines = getattr(preds[0], "text_lines", []) or []
+        texts = [getattr(ln, "text", "") for ln in lines]
+        confs = [c for c in (getattr(ln, "confidence", None) for ln in lines)
+                 if c is not None]
+        text = "\n".join(t for t in texts if t)
+
+        return OCRResult(
+            text=text,
+            words=[],
+            avg_confidence=(sum(confs) / len(confs) if confs
+                            else (0.80 if text.strip() else 0.0)),
+            engine="surya",
         )
 
 
-############################################
-# SELECT OCR
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
+# Async helper
+# ──────────────────────────────────────────────────────────────────────────────
 
-def select_ocr(
+async def run_extract_async(engine: OCREngine, image) -> OCRResult:
+    """Run a blocking OCR engine in a worker thread.
 
-        image,
-
-        primary,
-
-        fallback=None,
-
-        confidence_threshold=0.82
-
-):
-
-    primary_res = primary.extract(image)
-
-    reason = should_fallback_to_surya(
-
-        primary_res.text,
-
-        primary_res.avg_confidence,
-
-        confidence_threshold
-
-    )
-
-    primary_res.decision_reason = (
-
-        reason or
-
-        "primary_ok"
-
-    )
-
-    if fallback and reason:
-
-        try:
-
-            fb = fallback.extract(image)
-
-            fb.decision_reason = (
-
-                f"fallback:{reason}"
-
-            )
-
-            return fb
-
-        except:
-
-            pass
-
-    return primary_res
+    onnxruntime releases the GIL during inference, so a batch of these
+    awaited together with `asyncio.gather` overlaps real CPU work.
+    """
+    return await asyncio.to_thread(engine.extract, image)

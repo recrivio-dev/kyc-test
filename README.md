@@ -1,278 +1,592 @@
-## KYC Verification Pipeline
+# Recrivio KYC OCR Pipeline
 
-Demo pipeline for Indian KYC document classification, verification, OCR extraction and physical redaction (masking).
+Fast, async OCR + classification + redaction for Indian KYC documents.
+Locates text first, OCRs only the crops concurrently, classifies the
+document, extracts structured fields into a stable per-document JSON
+contract, and produces a redacted image.
 
-Supported document types: **Aadhaar, PAN, Voter ID, Passport, Driving License**.
-
-This repository contains a CLI and a Streamlit UI to run the KYC pipeline implemented in `kyc_pipeline.py`.
-
-### What is included
-- `kyc_pipeline.py` - main `DocumentPipeline`: loads images/PDFs, runs OCR, classifies documents, extracts IDs, and creates masked images.
-- `ocr_engines.py` - OCR engine wrappers: `PaddleOCREngine`, `SuryaOCREngine`, `TesseractOCREngine`, plus the fallback-selection logic.
-- `preprocessing.py` - OpenCV preprocessing: auto-crop, deskew, enhancement, resizing and 90° rotation helpers.
-- `main.py` - interactive terminal program to run the pipeline.
-- `app.py` - Streamlit dashboard for quick uploads and visual results.
-- `sample-docs/` - storage folder for sample inputs and masked outputs (`sample-docs/mask_debug/` holds masking debug overlays).
-
----
-
-## How it works
-
-The pipeline uses **two OCR engines for two different jobs**:
-
-1. **Text extraction & classification — PaddleOCR (Surya fallback).**
-   PaddleOCR reads the document cleanly. The image is auto-cropped, deskewed, and tried at all four 90° rotations; the orientation with the best OCR text/confidence is kept. If PaddleOCR output is weak (too little text, low confidence, or multilingual), it falls back to SuryaOCR.
-
-2. **Masking / redaction — Tesseract.**
-   PaddleOCR returns *line-level* boxes, which over-redact (large vertical/horizontal black bars). Masking instead uses Tesseract's tight *word-level* boxes. The masking stage is **orientation-robust**: it independently tries all four 90° rotations and masks in the one where Tesseract reads the ID best — so sideways/vertical scans (common with Voter ID cards) are masked correctly. The redacted image is then rotated back to the original orientation before saving.
-
-What gets masked: the sensitive part of the detected ID number is covered with a solid black box. For Aadhaar the first 8 digits are redacted and the last 4 are left visible (`XXXX XXXX 1234`).
+| Document             | `document_type` values emitted by the API                                  |
+| -------------------- | -------------------------------------------------------------------------- |
+| Aadhaar              | `aadhaar_front_bottom`, `aadhaar_back` (both when one image has both sides) |
+| PAN                  | `pan`                                                                       |
+| Passport             | `passport_front`, `passport_back`                                           |
+| Voter ID             | `voterid_front`, `voterid_back`                                             |
+| Driving Licence / RC | top-level `document_type` of `"DL"` or `"RC"`                              |
 
 ---
 
-## Setup
-
-Prerequisites:
-
-- Python 3.8+ (3.10 recommended)
-- **Tesseract OCR binary** — required for the masking stage.
-  - macOS: `brew install tesseract`
-  - Ubuntu/Debian: `sudo apt install tesseract-ocr`
-  - Verify with `tesseract --version`.
-- OCR engines (installed via `requirements.txt`):
-  - PaddleOCR — primary extraction engine
-  - SuryaOCR — optional extraction fallback
-  - pytesseract — Python binding for the Tesseract masking engine
-
-Create and activate a virtual environment (recommended):
+## Quick start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install Python dependencies:
-
-```bash
+# 1. Setup
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
 
-Notes on packages:
-- `pypdfium2` rasterizes PDF pages. Install docs: https://pypdfium2.readthedocs.io/
-- `opencv-python-headless` is used to avoid GUI dependencies.
-- `paddleocr` is the primary OCR engine and pulls in `paddlepaddle`; install can take a while.
-- `surya-ocr` is the optional extraction fallback.
-- If Tesseract is not installed, masking silently falls back to PaddleOCR (lower quality) — install the binary for best results.
+# 2. FastAPI service (for frontends)
+uvicorn api:app --reload --port 8000
 
----
+# 3. Streamlit UI (visual sanity check + JSON viewer)
+streamlit run app.py
 
-## Run (Terminal / CLI)
-
-```bash
+# 4. CLI (interactive, mostly for local testing)
 python main.py
 ```
 
-Follow the prompts to select the document type and enter the full path to the image or PDF file.
+Smoke-test the HTTP endpoint:
 
-Hints:
-- Supported input types: `jpg, jpeg, png, webp, pdf`.
-- Output masked images and temporary files are saved under `sample-docs/`.
-- Masking debug overlays (green boxes showing detected regions) are saved under `sample-docs/mask_debug/`.
+```bash
+curl -F "file=@sample/pan-test.png" -F "doc_type=PAN" \
+     http://127.0.0.1:8000/api/v1/ocr | jq
+```
 
 ---
 
-## Run (Streamlit UI)
+## Why this design
+
+The original pipeline did four full-page PaddleOCR passes (one per 90°
+rotation) plus a Surya fallback plus four full-page Tesseract passes for
+mask boxes. That's slow.
+
+The new pipeline never sends the full page to a recognition engine. It
+**locates** text regions in one cheap pass, then **reads only the
+crops** — concurrently. Surya is invoked only on individual
+low-confidence crops, never the full page. Masking uses the layout
+detector's box geometry directly with `cv2.rectangle`, so Tesseract is
+gone entirely.
+
+End-to-end latency on the sample images dropped from **~14 s → ~1–3 s**
+per document.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          process_and_verify                          │
+│                                                                      │
+│  load → auto-crop → deskew → orient → resize ─→ work_image           │
+│                                                                      │
+│       Stage 1 — LOCATE                                               │
+│       LayoutDetector.detect(work) → [Region, …]                      │
+│         backend: 'rapidocr_det' (default) | 'yolo' (pluggable)       │
+│                                                                      │
+│       Stage 2 — READ                                                 │
+│         rapidocr_det:  one fused detect+rec pass (RapidOCR/ONNX)     │
+│         yolo:          asyncio.gather over crop OCRs                 │
+│                                                                      │
+│       Stage 3 — FALLBACK                                             │
+│         crops where conf < fallback_threshold → asyncio.gather Surya │
+│                                                                      │
+│       Stage 4 — MASK                                                 │
+│         find sensitive region by regex on each region's text         │
+│         cv2.rectangle on its bbox (Aadhaar: partial mask keep last4) │
+│                                                                      │
+│       Stage 5 — RESPOND                                              │
+│         build_output_json(doc_type, regions, text)                   │
+│         → per-doc-type contract                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Stages in detail
+
+1. **Preprocess** — `pypdfium2` renders PDFs; OpenCV auto-crops the
+   document and deskews. Orientation is then probed at 0°/90°/180°/270°
+   in parallel using RapidOCR with the `cls` (angle-class) model
+   **disabled**, scored as `landscape_bbox_count × avg_conf × text_len`.
+   Disabling `cls` is what lets 0° beat 180° — with `cls` on,
+   upside-down text gets silently rotated and both score the same.
+
+2. **Locate** — `LayoutDetector` ([layout_detector.py](layout_detector.py))
+   returns axis-aligned regions for every text-bearing area. Default
+   backend reuses RapidOCR's ONNX text-detection model. A pluggable
+   YOLOv8 ONNX backend exists for field-level detection — drop a model
+   at `models/layout.onnx` and set `LayoutSettings.backend = 'yolo'`.
+
+3. **Read** — For the line-level default backend, detection +
+   recognition are a single fused ONNX pass; re-cropping individual
+   lines and re-OCRing them only fragments words. For the YOLO field
+   backend, the few coarse field crops are OCR'd in parallel via
+   `asyncio.gather` over `asyncio.to_thread` — onnxruntime releases the
+   GIL during inference so real concurrency is achieved.
+
+4. **Fallback** — Any region whose recognition confidence falls below
+   `OCRSettings.fallback_threshold` (default 0.75) triggers a Surya
+   re-OCR on that crop only. Surya is loaded lazily on first need. It is
+   **off by default** (`OCRSettings.enable_surya_fallback = False`)
+   because the installed `surya-ocr 0.17` is currently brittle against
+   `transformers` version skew; flip the flag once the deps are aligned.
+
+5. **Mask** — The pipeline detects which region holds the sensitive ID
+   by regex over each region's text, then blacks that region's bbox with
+   a single `cv2.rectangle` call. Aadhaar partial-masks every occurrence
+   (the 12-digit number prints on both card sides) keeping the right ~34%
+   visible so the last 4 digits remain readable.
+
+6. **Respond** — `output_schema.build_output_json` selects the
+   appropriate per-doc builder. Each builder runs heuristic + regex
+   extraction on the per-region OCR results to produce the JSON
+   contract.
+
+---
+
+## Models used
+
+| Role                  | Model                                            | Where loaded                                   | Notes                                                                    |
+| --------------------- | ------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------ |
+| Text detection        | PaddleOCR PP-OCR `det` (ONNX)                    | `RapidOCREngine.detect` / `extract`             | Bundled with `rapidocr-onnxruntime`. Releases GIL → safe to thread.       |
+| Text recognition      | PaddleOCR PP-OCR `rec` (ONNX)                    | `RapidOCREngine.extract`                        | Same package.                                                            |
+| Angle classifier      | PaddleOCR PP-OCR `cls` (ONNX)                    | enabled by default in `extract`, off in `extract_no_cls` | Used by RapidOCR internally to flip 180°-rotated lines. Disabled when probing global orientation. |
+| Fallback OCR (opt-in) | Surya foundation + recognition + detection      | `SuryaOCREngine` lazy init                      | ~1.34 GB download on first use. Off by default until deps are pinned.    |
+| Layout detector (opt) | Generic YOLOv8 ONNX (e.g. DocLayout-YOLO)        | `_YoloLayout` in `layout_detector.py`            | Optional. Plug in via `LayoutSettings.yolo_model_path`.                  |
+
+No PaddlePaddle dependency, no GPU required.
+
+---
+
+## Project structure
+
+```
+ocr-all-classifier/
+├── api.py                  FastAPI service (POST /api/v1/ocr, GET /healthz)
+├── app.py                  Streamlit UI
+├── main.py                 CLI entry point
+├── kyc_pipeline.py         async DocumentPipeline (locate → read → mask)
+├── ocr_engines.py          RapidOCREngine, SuryaOCREngine, async helper
+├── layout_detector.py      LayoutDetector + Region; rapidocr_det / yolo backends
+├── output_schema.py        per-doc JSON builders + field extractors
+├── preprocessing.py        auto_crop / deskew / rotate / resize
+├── config.py               dataclasses for OCR/Layout/Mask settings
+├── requirements.txt
+├── sample/                 input fixtures
+└── sample-docs/            masked output images
+```
+
+---
+
+## How to use
+
+### FastAPI service
+
+```bash
+uvicorn api:app --reload --port 8000
+```
+
+Endpoints:
+
+| Method | Path           | Body / params                                                                                 | Returns                                              |
+| ------ | -------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| GET    | `/healthz`     | —                                                                                             | `{"ok": true}`                                       |
+| POST   | `/api/v1/ocr`  | multipart form: `file` (image/PDF) + `doc_type` (PAN / AADHAAR / PASSPORT / VOTER_ID / DRIVING_LICENSE) | Document-specific JSON (see [JSON responses](#json-responses)) |
+
+CORS is permissive by default (`*`) — tighten in production by editing
+[api.py](api.py).
+
+### Streamlit UI
 
 ```bash
 streamlit run app.py
 ```
 
-This opens a browser window (or gives a local URL) where you select an intended document type and upload an image or PDF.
+Pick a document type, upload an image/PDF, click **Execute KYC
+Pipeline**. The right pane shows the redacted image preview, an "API
+response JSON" expander (the same payload the FastAPI endpoint
+returns), and a debug panel with the layout-detection overlay and
+orientation angle.
 
-UI behavior:
-- Use the left panel to pick a document type and upload the file.
-- Click "Execute KYC Pipeline" to run. Results, masked image preview, and raw OCR text appear on the right.
+### CLI
 
----
+```bash
+python main.py
+```
 
-## Troubleshooting / Tips
-
-- If OCR returns no text or unexpected results, try a higher-resolution or clearer scan.
-- If masking produces no black boxes, ensure the `tesseract` binary is on your PATH (`tesseract --version`).
-- Sideways/vertical scans are handled automatically — the masking stage detects the correct orientation itself.
-- For PDFs with multiple pages, only the first page is processed.
-
-## License & Attribution
-
-Provided as-is for testing and demonstration purposes.
+Prompts for a document type and a file path. Prints the raw text and
+the final status.
 
 ---
 
-## Architecture Diagrams (Mermaid)
+## JSON responses
 
-Diagrams for the flow and architecture. GitHub and many Markdown renderers support Mermaid; otherwise paste the blocks into https://mermaid.live.
+Every endpoint response is wrapped in the same envelope:
 
-### 1) Data Flow Diagram (DFD)
+```json
+{
+  "data": { ... per-doc-type payload ... },
+  "status_code": 200,
+  "message_code": "success",
+  "message": null,
+  "success": true
+}
+```
+
+`confidence` values are integers on a 0–100 scale (`int(round(score *
+100))` of RapidOCR's per-region recognition score). Fields that
+couldn't be extracted come back as empty strings with `confidence: 0`
+— the shape stays stable so the frontend can rely on it.
+
+### PAN
+
+```json
+{
+  "data": {
+    "ocr_fields": [{
+      "document_type": "pan",
+      "pan_number":  {"value": "ABCDE1234F", "confidence": 100},
+      "full_name":   {"value": "John Doe",   "confidence": 99},
+      "father_name": {"value": "Richard Doe","confidence": 99},
+      "dob":         {"value": "15/08/1990", "confidence": 100}
+    }]
+  },
+  "status_code": 200, "message_code": "success", "message": null, "success": true
+}
+```
+
+### Aadhaar — emits only the side(s) actually present
+
+```json
+{
+  "data": {
+    "ocr_fields": [
+      {
+        "document_type": "aadhaar_front_bottom",
+        "full_name":  {"value": "John Doe",  "confidence": 99},
+        "gender":     {"value": "M",         "confidence": 98},
+        "mother_name":{"value": "",          "confidence": 0},
+        "father_name":{"value": "",          "confidence": 0},
+        "dob":        {"value": "1990-08-15","confidence": 93, "yob": false},
+        "aadhaar_number": {
+          "value": "123456789012", "confidence": 100,
+          "is_masked": false, "input_validation": false
+        },
+        "image_url": null,
+        "uniqueness_id": "0123456789abcdef…fedcba9876543210"
+      },
+      {
+        "document_type": "aadhaar_back",
+        "address": {
+          "value": "C/O: Richard Doe, House No 100, Main Street, Sample City 110001",
+          "confidence": 93,
+          "house_number": "100", "district": "Sample District",
+          "city": "Sample City", "state": "Sample State",
+          "country": "INDIA",    "zip": "110001",
+          "first_line": "", "second_line": "",
+          "locality": "", "landmark": ""
+        },
+        "zip":  {"value": "110001", "confidence": 93},
+        "care_of": {"value": "Richard Doe", "confidence": 93, "relation": "care_of"},
+        "aadhaar_number": {
+          "value": "123456789012", "confidence": 100,
+          "is_masked": false, "input_validation": false
+        },
+        "image_url": null
+      }
+    ]
+  },
+  ...
+}
+```
+
+`uniqueness_id` is `sha256(aadhaar_number)` — same person → same hash —
+so the backend can dedupe submissions without storing the raw number.
+Empty string when the Aadhaar number can't be extracted.
+
+`care_of.relation` is inferred from the prefix in the address:
+`C/O → care_of`, `S/O`/`D/O → father`, `W/O → husband`, default `father`.
+
+### Passport (front and back are distinct shapes)
+
+**`passport_front`** — extracted primarily from the MRZ lines, with
+labelled-field fallback for `dob`, `doe`, `gender` when MRZ is garbled:
+
+```json
+{
+  "data": {
+    "ocr_fields": [{
+      "document_type": "passport_front",
+      "country_code":     {"value": "IND",         "confidence": 91},
+      "dob":              {"value": "15/08/1990",  "confidence": 91},
+      "doe":              {"value": "14/08/2030",  "confidence": 93},
+      "doi":              {"value": "15/08/2020",  "confidence": 91},
+      "gender":           {"value": "M",           "confidence": 72},
+      "given_name":       {"value": "John",        "confidence": 91},
+      "nationality":      {"value": "INDIAN",      "confidence": 91},
+      "passport_num":     {"value": "A1234567",    "confidence": 91},
+      "place_of_birth":   {"value": "SAMPLE CITY, SAMPLE STATE", "confidence": 92},
+      "place_of_issue":   {"value": "SAMPLE CITY", "confidence": 92},
+      "surname":          {"value": "Doe",         "confidence": 91},
+      "mrz_line_1":       {"value": "P<INDDOE<<JOHN<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<", "confidence": 91},
+      "mrz_line_2":       {"value": "A1234567<8IND9008156M3008146<<<<<<<<<<<<<<<0",  "confidence": 91},
+      "type_of_passport": {"value": "P",           "confidence": 91},
+      "passport_validity": null
+    }]
+  }, ...
+}
+```
+
+**`passport_back`** — name fields come from positional extraction
+(names sit above the Address block), file number / passport number from
+regex:
+
+```json
+{
+  "data": {
+    "ocr_fields": [{
+      "document_type": "passport_back",
+      "address":         {"value": "100, SAMPLE BLOCK, SAMPLE AREA, SAMPLE CITY, SAMPLE DISTRICT, PIN:110001, SAMPLE STATE, INDIA", "confidence": 92},
+      "father":          {"value": "Richard Doe",     "confidence": 97},
+      "mother":          {"value": "Sarah Doe",       "confidence": 94},
+      "file_num":        {"value": "XX1234567890123", "confidence": 100},
+      "old_doi":         {"value": "", "confidence": 0},
+      "old_passport_num":{"value": "", "confidence": 0},
+      "old_place_of_issue":{"value": "", "confidence": 0},
+      "pin":             {"value": "110001", "confidence": 92},
+      "spouse":          {"value": "", "confidence": 0}
+    }]
+  }, ...
+}
+```
+
+### Voter ID
+
+```json
+{
+  "data": {
+    "ocr_fields": [{
+      "document_type": "voterid_front",
+      "full_name":  {"value": "John Doe",    "confidence": 92},
+      "age":        {"value": "35",          "confidence": 95},
+      "care_of":    {"value": "Richard Doe", "confidence": 97},
+      "dob":        {"value": "1990-01-01",  "confidence": 76},
+      "doc":        {"value": "2020-01-01",  "confidence": 0},
+      "gender":     {"value": "M",           "confidence": 84},
+      "epic_number":{"value": "ABC1234567",  "confidence": 95}
+    }]
+  }, ...
+}
+```
+
+A `voterid_back` shape is emitted instead when the image only shows the
+address side.
+
+### Driving Licence / RC (Vehicle Registration Certificate)
+
+The same endpoint handles both — `document_type` is the variant the
+frontend should route on. RC and DL share a flat schema (no
+`{value, confidence}` blocks, no `ocr_fields` array):
+
+```json
+{
+  "data": {
+    "name": "John Doe",
+    "address": "FLAT 100, SAMPLE BLOCK, SAMPLE AREA, SAMPLE CITY-110001",
+    "document_number": "XX01YY1234",
+    "document_type": "RC",
+    "chassis_number": "SAMPLECHASSIS1234567",
+    "engine_number":  "SAMPLEENGINE1234",
+    "issue_date":     "01-01-2023",
+    "expiry_date":    "31-12-2042"
+  }, ...
+}
+```
+
+For a genuine driving licence, `document_type = "DL"`,
+`document_number` is the DL number, and `chassis_number` / `engine_number`
+are empty.
+
+### Failure shape
+
+When classification fails, ID extraction fails, or the OCR backend is
+unavailable, the same envelope is returned with a populated `message`:
+
+```json
+{
+  "data": {},
+  "status_code": 400,
+  "message_code": "failed",
+  "message": "Expected PASSPORT, got UNKNOWN",
+  "success": false
+}
+```
+
+---
+
+## Configuration
+
+Every tunable lives in [config.py](config.py):
+
+```python
+@dataclass
+class OCRSettings:
+    primary_lang: str = "en"
+    fallback_threshold: float = 0.75       # Surya re-OCR threshold
+    enable_surya_fallback: bool = False    # off until surya/transformers pinned
+
+@dataclass
+class LayoutSettings:
+    backend: str = "rapidocr_det"          # or "yolo"
+    yolo_model_path: str = "models/layout.onnx"
+    yolo_classes: tuple = ("text","title","list","table","figure")
+    score_threshold: float = 0.30
+    detect_orientation: bool = True
+
+@dataclass
+class MaskSettings:
+    pad_ratio: float = 0.18
+    aadhaar_visible_ratio: float = 0.34    # right portion kept readable
+    merge_gap: int = 22
+
+@dataclass
+class Settings:
+    ocr: OCRSettings
+    layout: LayoutSettings
+    mask: MaskSettings
+    output_dir: str = "sample-docs"
+    work_max_side: int = 2000
+```
+
+---
+
+## Architecture diagrams
+
+### Stage flow (DFD)
 
 ```mermaid
 flowchart TD
-	U[User]
-	S[Streamlit UI or CLI]
-	FS[(sample-docs storage)]
-	P[DocumentPipeline]
-	PDF[pypdfium2 PDF render]
-	CV[OpenCV preprocess - crop/deskew/rotate]
-	PAD[PaddleOCR - extraction]
-	SUR[SuryaOCR - extraction fallback]
-	CLF[Classifier and Pattern Matcher]
-	TES[Tesseract - masking OCR]
-	MASK[Masking / Redaction]
+    U[User / Frontend]
+    UI[Streamlit UI / FastAPI]
+    FS[(sample-docs)]
+    P[DocumentPipeline.process_and_verify]
+    PDF[pypdfium2]
+    CV[OpenCV pre-process]
+    LD[LayoutDetector]
+    PR[RapidOCREngine - primary]
+    SR[SuryaOCREngine - opt fallback]
+    SCHEMA[output_schema builders]
+    MASK[Direct cv2.rectangle masking]
 
-	U -->|upload file| S
-	S -->|save temp file| FS
-	S -->|invoke pipeline| P
-	P --> PDF
-	P --> CV
-	CV --> PAD
-	PAD -.low confidence.-> SUR
-	PAD -->|text| CLF
-	SUR -->|text| CLF
-	CLF -->|detected type and id| MASK
-	MASK --> TES
-	TES -->|word boxes| MASK
-	MASK -->|masked image| FS
-	P -->|result json| S
-	S -->|render| U
-
-	style FS fill:#f9f,stroke:#333,stroke-width:1px
-	style P fill:#bbf,stroke:#333,stroke-width:1px
-	style PAD fill:#ffd,stroke:#333,stroke-width:1px
-	style TES fill:#dfd,stroke:#333,stroke-width:1px
+    U -->|file + doc_type| UI
+    UI -->|save temp file| FS
+    UI -->|invoke async pipeline| P
+    P --> PDF
+    P --> CV
+    P --> LD
+    LD --> PR
+    PR -. low-confidence crop .-> SR
+    P --> MASK
+    MASK --> FS
+    P --> SCHEMA
+    SCHEMA -->|output_json| UI
+    UI --> U
 ```
 
-Short explanation: The user uploads a document via the Streamlit UI (or CLI). The file is saved to `sample-docs/` and passed to `DocumentPipeline`. PDFs are rasterized with `pypdfium2`; images are cropped/deskewed/rotated by OpenCV. **PaddleOCR** extracts text (falling back to **SuryaOCR** on weak output), which feeds the classifier and pattern matcher. Once an ID is found, the masking stage runs **Tesseract** to get tight word boxes, redacts the sensitive region, and writes the masked image back to `sample-docs/`.
-
-### 2) Overall System Flow
+### Sequence — single FastAPI request
 
 ```mermaid
 sequenceDiagram
-	participant U as User
-	participant UI as Streamlit/CLI
-	participant FS as FileSystem
-	participant DP as DocumentPipeline
-	participant PDF as pypdfium2
-	participant CV as OpenCV
-	participant PAD as PaddleOCR/Surya
-	participant TES as Tesseract
+    participant FE as Frontend
+    participant API as FastAPI api.py
+    participant DP as DocumentPipeline
+    participant LD as LayoutDetector
+    participant RO as RapidOCR (ONNX)
+    participant SU as Surya (opt)
+    participant CV as OpenCV
+    participant SC as output_schema
 
-	U->>UI: Upload file + select doc type
-	UI->>FS: Save temp file
-	UI->>DP: process_and_verify(file, intended_type)
-	DP->>PDF: (if pdf) render first page
-	DP->>CV: auto-crop, deskew
-	DP->>PAD: OCR at 0/90/180/270, pick best orientation
-	PAD-->>DP: text + confidence
-	DP->>DP: classify_document & verify_and_extract
-	DP->>TES: create_masked_image - OCR at 4 rotations
-	TES-->>DP: word boxes for best orientation
-	DP->>DP: redact word boxes, rotate back
-	DP->>FS: write masked image (+ debug overlay)
-	DP-->>UI: result dict (status, extracted_id, masked image path)
-	UI-->>U: render result
+    FE->>API: POST /api/v1/ocr (file, doc_type)
+    API->>DP: await process_and_verify(path, doc_type)
+    DP->>DP: load → crop → deskew
+    DP->>RO: 4× extract_no_cls in parallel (orientation probe)
+    RO-->>DP: best angle
+    DP->>LD: detect(work)
+    LD->>RO: text-detection ONNX pass
+    LD-->>DP: regions
+    DP->>RO: fused detect+rec (or per-crop gather for yolo backend)
+    RO-->>DP: per-region text + conf
+    DP->>SU: gather low-conf crops (opt-in)
+    SU-->>DP: improved text (if enabled)
+    DP->>DP: classify_document (regex + signatures)
+    DP->>CV: cv2.rectangle on sensitive bbox(es)
+    DP->>SC: build_output_json(doc_type, regions, text)
+    SC-->>DP: per-doc JSON
+    DP-->>API: result with output_json + elapsed_sec
+    API-->>FE: JSONResponse
 ```
 
-### 3) Sequence (detailed single-request run)
-
-```mermaid
-sequenceDiagram
-	participant User
-	participant Streamlit
-	participant Pipeline
-	participant Paddle as PaddleOCR
-	participant Tess as Tesseract
-
-	User->>Streamlit: Upload `aadhaar.jpg`, select "AADHAAR"
-	Streamlit->>Pipeline: process_and_verify(file, "AADHAAR")
-	Pipeline->>Pipeline: load_document_image(file)
-	Pipeline->>Pipeline: extract_and_orient() - crop, deskew, try 4 rotations
-	Pipeline->>Paddle: OCR each rotation (Surya fallback if weak)
-	Paddle-->>Pipeline: best text + orientation
-	Pipeline->>Pipeline: classify_document(text)
-	Pipeline->>Pipeline: verify_and_extract(text, "AADHAAR")
-	Pipeline->>Tess: create_masked_image() - OCR at 0/90/180/270
-	Tess-->>Pipeline: word boxes (orientation with most ID hits)
-	Pipeline->>Pipeline: redact boxes, rotate image back
-	Pipeline-->>Streamlit: result dict + masked image path
-	Streamlit-->>User: displays masked image + text
-```
-
-### 4) High-Level Design (HLD) / Component Diagram
+### Component diagram (HLD)
 
 ```mermaid
 graph LR
-  subgraph UI
-    A[Streamlit app - app.py]
-    B[CLI - main.py]
+  subgraph Interfaces
+    A[app.py - Streamlit]
+    B[main.py - CLI]
+    C[api.py - FastAPI]
   end
 
-  subgraph Core
-    P[DocumentPipeline - kyc_pipeline.py]
-    CV[preprocessing.py - OpenCV]
-    PDF[pypdfium2]
-    CLF[Classifier and Patterns]
-    MASK[Masking module]
+  subgraph Pipeline
+    P[DocumentPipeline]
+    PRE[preprocessing.py]
+    LD[LayoutDetector]
   end
 
-  subgraph OCR Engines - ocr_engines.py
-    PAD[PaddleOCREngine - extraction]
-    SUR[SuryaOCREngine - fallback]
-    TES[TesseractOCREngine - masking]
+  subgraph OCR
+    RO[RapidOCREngine - ONNX]
+    SU[SuryaOCREngine - opt]
+  end
+
+  subgraph Output
+    SCH[output_schema.py - per-doc builders]
   end
 
   subgraph Storage
-    FS[(sample-docs folder)]
+    FS[(sample-docs)]
   end
 
   A --> P
   B --> P
-  P --> PDF
-  P --> CV
-  P --> PAD
-  PAD --> SUR
-  P --> CLF
-  CLF --> MASK
-  MASK --> TES
-  MASK --> FS
+  C --> P
+  P --> PRE
+  P --> LD
+  LD --> RO
+  P --> RO
+  P -. weak crops .-> SU
+  P --> SCH
   P --> FS
 ```
 
-Short HLD note: `DocumentPipeline` orchestrates PDF rendering, image preprocessing, OCR extraction, classification, ID extraction, and masking. Extraction uses PaddleOCR (Surya fallback); masking uses Tesseract for tight word-level boxes. The UI layers simply persist an uploaded file and call the pipeline.
+---
 
-### 5) ER Diagram (Artifacts & Metadata)
+## Known caveats
 
-This project currently uses the filesystem for outputs rather than a database. The ER diagram below models a possible minimal persistence schema if you want to store runs and artifacts in a DB.
+- **Surya fallback is gated off by default** — `surya-ocr 0.17` in this
+  venv crashes at inference with `SuryaDecoderConfig has no attribute
+  pad_token_id` (transformers version skew). Flip
+  `OCRSettings.enable_surya_fallback = True` after pinning compatible
+  versions.
+- **Generic vs field-level layout** — with the default `rapidocr_det`
+  backend, regions are *text lines*, not labelled fields, so identifying
+  which region holds the sensitive ID still uses regex over the
+  recognised text. To get truly text-recognition-independent field
+  routing, plug a trained ID-field YOLO ONNX at `models/layout.onnx` and
+  switch the backend to `yolo`.
+- **e-Aadhaar fold layout** — the printable "tear-off" mini-card on
+  some e-Aadhaar PDFs is intentionally upside-down relative to the main
+  page. We can only pick one global orientation; the orientation
+  detector reliably picks the main side, but the partial mask on the
+  flipped mini-card may end up on the wrong end. Mask the whole bbox
+  (set `MaskSettings.aadhaar_visible_ratio = 0`) if that's a concern.
+- **Heuristic field extraction** — addresses, names, and ages are
+  extracted by regex + label-anchored / positional heuristics, not by a
+  field-level model. We emit empty strings with `confidence: 0` when
+  extraction can't recover a value confidently rather than guessing.
+- **DL DOI without label** — when a DL's `Date of Issue` / `Valid Till`
+  labels are missed by OCR, the issue/expiry fallback year-sorts every
+  date in the text (earliest = issue, latest = expiry). This can pick
+  the DOB year on cards where the DOB is older than the issue date.
+- **First-page only for PDFs** — multi-page PDFs are not iterated. PR
+  welcome.
 
-```mermaid
-erDiagram
-		RUNS {
-				string run_id PK
-				string filename
-				string intended_type
-				string actual_type
-				string status
-				string extracted_id
-				datetime created_at
-		}
+---
 
-		ARTIFACTS {
-				string artifact_id PK
-				string run_id FK
-				string artifact_type
-				string path
-				string content_type
-		}
+## License
 
-		RUNS ||--o{ ARTIFACTS : produces
-```
-
-Explanation: A `RUNS` table stores each pipeline execution (intent, result, extracted id). `ARTIFACTS` stores file outputs (masked images, original upload) linked to runs by `run_id`.
+Provided as-is for testing and demonstration purposes.

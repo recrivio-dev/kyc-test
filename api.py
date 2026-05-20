@@ -3,10 +3,18 @@
 Run locally:
     uvicorn api:app --reload --port 8000
 
-The single business endpoint is ``POST /api/v1/ocr``:
+Generic endpoint (``doc_type`` chosen by the caller):
 
     curl -F "file=@sample/pan-test.png" -F "doc_type=PAN" \\
          http://127.0.0.1:8000/api/v1/ocr
+
+Per-document-type endpoints (no ``doc_type`` form field needed):
+
+    POST /api/v1/ocr/pan
+    POST /api/v1/ocr/aadhaar
+    POST /api/v1/ocr/passport
+    POST /api/v1/ocr/voter-id
+    POST /api/v1/ocr/driving-license
 
 The response body is exactly the contract documented in
 ``output_schema.py`` — i.e. the same JSON that the Streamlit UI displays.
@@ -50,13 +58,7 @@ def healthz():
     return {"ok": _pipeline.ocr_available}
 
 
-@app.post("/api/v1/ocr")
-async def ocr_endpoint(
-    file: UploadFile = File(...),
-    doc_type: DocType = Form(...),
-):
-    """Run the full locate→read→mask pipeline on an uploaded document and
-    return the structured JSON contract."""
+async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
     suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
     fd, path = tempfile.mkstemp(suffix=suffix)
     try:
@@ -79,3 +81,38 @@ async def ocr_endpoint(
         content=payload,
         status_code=payload.get("status_code", 200),
     )
+
+
+@app.post("/api/v1/ocr")
+async def ocr_endpoint(
+    file: UploadFile = File(...),
+    doc_type: DocType = Form(...),
+):
+    """Run the full locate→read→mask pipeline on an uploaded document and
+    return the structured JSON contract."""
+    return await _run_pipeline(file, doc_type)
+
+
+@app.post("/api/v1/ocr/pan")
+async def ocr_pan(file: UploadFile = File(...)):
+    return await _run_pipeline(file, "PAN")
+
+
+@app.post("/api/v1/ocr/aadhaar")
+async def ocr_aadhaar(file: UploadFile = File(...)):
+    return await _run_pipeline(file, "AADHAAR")
+
+
+@app.post("/api/v1/ocr/passport")
+async def ocr_passport(file: UploadFile = File(...)):
+    return await _run_pipeline(file, "PASSPORT")
+
+
+@app.post("/api/v1/ocr/voter-id")
+async def ocr_voter_id(file: UploadFile = File(...)):
+    return await _run_pipeline(file, "VOTER_ID")
+
+
+@app.post("/api/v1/ocr/driving-license")
+async def ocr_driving_license(file: UploadFile = File(...)):
+    return await _run_pipeline(file, "DRIVING_LICENSE")

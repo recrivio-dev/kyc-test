@@ -35,8 +35,13 @@ python main.py
 Smoke-test the HTTP endpoint:
 
 ```bash
+# Generic — caller picks the doc type
 curl -F "file=@sample/pan-test.png" -F "doc_type=PAN" \
      http://127.0.0.1:8000/api/v1/ocr | jq
+
+# Or hit the per-doc-type endpoint directly (no doc_type form field)
+curl -F "file=@sample/pan-test.png" \
+     http://127.0.0.1:8000/api/v1/ocr/pan | jq
 ```
 
 ---
@@ -148,7 +153,7 @@ No PaddlePaddle dependency, no GPU required.
 
 ```
 ocr-all-classifier/
-├── api.py                  FastAPI service (POST /api/v1/ocr, GET /healthz)
+├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], GET /healthz)
 ├── app.py                  Streamlit UI
 ├── main.py                 CLI entry point
 ├── kyc_pipeline.py         async DocumentPipeline (locate → read → mask)
@@ -174,10 +179,20 @@ uvicorn api:app --reload --port 8000
 
 Endpoints:
 
-| Method | Path           | Body / params                                                                                 | Returns                                              |
-| ------ | -------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| GET    | `/healthz`     | —                                                                                             | `{"ok": true}`                                       |
-| POST   | `/api/v1/ocr`  | multipart form: `file` (image/PDF) + `doc_type` (PAN / AADHAAR / PASSPORT / VOTER_ID / DRIVING_LICENSE) | Document-specific JSON (see [JSON responses](#json-responses)) |
+| Method | Path                            | Body / params                                                                                          | Returns                                                        |
+| ------ | ------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| GET    | `/healthz`                      | —                                                                                                      | `{"ok": true}`                                                 |
+| POST   | `/api/v1/ocr`                   | multipart form: `file` (image/PDF) + `doc_type` (PAN / AADHAAR / PASSPORT / VOTER_ID / DRIVING_LICENSE) | Document-specific JSON (see [JSON responses](#json-responses)) |
+| POST   | `/api/v1/ocr/pan`               | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=PAN`                |
+| POST   | `/api/v1/ocr/aadhaar`           | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=AADHAAR`            |
+| POST   | `/api/v1/ocr/passport`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=PASSPORT`           |
+| POST   | `/api/v1/ocr/voter-id`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=VOTER_ID`           |
+| POST   | `/api/v1/ocr/driving-license`   | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=DRIVING_LICENSE`    |
+
+The per-doc-type routes are convenience wrappers — the frontend can
+pick the URL based on the doc type the user selected and skip the
+`doc_type` form field. They share the generic endpoint's pipeline and
+response envelope.
 
 CORS is permissive by default (`*`) — tighten in production by editing
 [api.py](api.py).

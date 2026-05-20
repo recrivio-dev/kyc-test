@@ -5,6 +5,11 @@ opencv-python-headless==4.11.0.86
 pypdfium2==4.30.0
 streamlit==1.48.1
 
+# HTTP API
+fastapi==0.118.0
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+
 # Primary OCR — PaddleOCR (PP-OCR) models served via ONNX Runtime.
 # No PaddlePaddle, no GPU needed; the ONNX session releases the GIL so
 # asyncio.gather over crops runs concurrently.

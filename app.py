@@ -119,6 +119,10 @@ with col2:
                         st.write(f"Avg confidence: **{result.get('ocr_avg_confidence')}**")
                         st.write(f"Decision: `{result.get('ocr_decision_reason')}`")
 
+            # Structured response — exact JSON returned by the API endpoint.
+            with st.expander("API response JSON", expanded=True):
+                st.json(result.get("output_json") or {})
+
             # Provide visibility into the complete raw string output layout logs
             with st.expander("Show Raw OCR Processing Data Log"):
                 st.code(result.get("extracted_text", "[No string content located]"), language="text")

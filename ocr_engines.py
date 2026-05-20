@@ -101,6 +101,29 @@ class RapidOCREngine(OCREngine):
         )
         return [_poly_to_xyxy(box) for box in (result or [])]
 
+    def extract_no_cls(self, image) -> OCRResult:
+        """Extract WITHOUT the angle-class model.
+
+        With `cls` enabled, RapidOCR silently rotates each detected text
+        line so 0° and 180° score about the same — useless as an
+        orientation probe. With `cls` disabled the recogniser reads pixels
+        as-is, so upright text scores high and upside-down text scores
+        very low, giving a clean 4-way orientation signal.
+        """
+        result, _ = self.engine(image, use_cls=False)
+        words, texts, confs = [], [], []
+        for item in (result or []):
+            box, txt, score = item[0], item[1], float(item[2])
+            words.append(OCRWordBox(txt, _poly_to_xyxy(box), score))
+            texts.append(txt)
+            confs.append(score)
+        return OCRResult(
+            text="\n".join(texts),
+            words=words,
+            avg_confidence=(sum(confs) / len(confs) if confs else None),
+            engine="rapidocr",
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallback — Surya (low-confidence crops only)

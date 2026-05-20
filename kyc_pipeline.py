@@ -29,6 +29,7 @@ import pypdfium2 as pdfium
 from config import SETTINGS, Settings
 from layout_detector import LayoutDetector, Region
 from ocr_engines import RapidOCREngine, SuryaOCREngine, run_extract_async
+from output_schema import build_output_json, failure_envelope
 from preprocessing import auto_crop_document, deskew, resize_for_ocr, rotate_image
 
 
@@ -53,9 +54,12 @@ class DocumentPipeline:
         self.patterns = {
             "PAN": r"[A-Z]{5}[0-9]{4}[A-Z]",
             "AADHAAR": r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)",
-            "VOTER_ID": r"[A-Z]{3}\d{7}",
+            "VOTER_ID": r"(?<![A-Z0-9])[A-Z]{3}\d{7}(?![A-Z0-9])",
             "PASSPORT": r"[A-Z]{1,2}\d{6,7}",
-            "DRIVING_LICENSE": r"[A-Z]{2}\d{2}\s?\d{11}",
+            # Real DL number OR Vehicle Registration Certificate number
+            # (e.g. CH01CY1547). The frontend treats both under 'license'.
+            "DRIVING_LICENSE":
+                r"[A-Z]{2}\d{2}\s?\d{11}|[A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5}",
         }
 
     # ── Bootstrap ────────────────────────────────────────────────────────────
@@ -103,18 +107,43 @@ class DocumentPipeline:
 
     # ── Stage helper: orientation ────────────────────────────────────────────
 
-    def _detect_orientation(self, img: np.ndarray) -> int:
-        """Pick the upright angle with one cheap detection-only probe per
-        rotation on a downscaled image. Upright text yields the most
-        landscape (wider-than-tall) regions."""
+    async def _detect_orientation(self, img: np.ndarray) -> int:
+        """Pick the upright angle by combining two cheap signals:
+
+          * landscape-bbox count — RapidOCR returns each text line as a
+            polygon; the axis-aligned bbox is wide for horizontal text and
+            tall for vertical text. So 0°/180° (image upright or flipped)
+            score high here and 90°/270° (image sideways) score low.
+            Differentiator for landscape vs portrait orientations.
+
+          * cls-disabled recognition confidence — with the angle-class
+            model OFF the recogniser reads pixels as-is, so upside-down
+            Latin/Devanagari text scores notably lower than upright text.
+            Differentiator for 0° vs 180°.
+
+        Score = landscape_count × avg_conf × text_len. The four probes
+        run concurrently on a 720-px downscaled copy."""
         if not self.settings.layout.detect_orientation:
             return 0
 
-        small = resize_for_ocr(img, max_side=900)
-        best_angle, best_score = 0, -1
-        for angle in (0, 90, 180, 270):
-            regions = self.layout.detect(rotate_image(small, angle))
-            score = sum(1 for r in regions if r.is_landscape)
+        small = resize_for_ocr(img, max_side=720)
+        rots = [rotate_image(small, a) for a in (0, 90, 180, 270)]
+        outs = await asyncio.gather(
+            *(asyncio.to_thread(self.primary_ocr.extract_no_cls, r)
+              for r in rots),
+            return_exceptions=True,
+        )
+        best_angle, best_score = 0, -1.0
+        for angle, res in zip((0, 90, 180, 270), outs):
+            if isinstance(res, Exception) or res is None:
+                continue
+            n_landscape = sum(
+                1 for w in res.words
+                if (w.bbox[2] - w.bbox[0]) > (w.bbox[3] - w.bbox[1])
+            )
+            conf = res.avg_confidence or 0.0
+            text_len = sum(len(w.text) for w in res.words)
+            score = n_landscape * conf * text_len
             if score > best_score:
                 best_angle, best_score = angle, score
         return best_angle
@@ -198,6 +227,10 @@ class DocumentPipeline:
 
     def classify_document(self, text: str) -> str:
         text = text.upper()
+        # RapidOCR frequently runs adjacent words together (e.g. it reads
+        # "REPUBLIC OF INDIA" as "REPUBLICOFINDIA"). Match signatures against
+        # both the raw and whitespace-stripped text.
+        nospace = re.sub(r"\s+", "", text)
         scores = {k: 0 for k in self.patterns}
 
         signatures = {
@@ -207,18 +240,47 @@ class DocumentPipeline:
                          ("PHOTO IDENTITY", 30), ("EPIC", 50)],
             "DRIVING_LICENSE": [("DL NO", 50), ("VALID TILL", 30), ("MCWG", 25),
                                 ("LMV", 25), ("DRIVING LICENCE", 40),
-                                ("DRIVING LICENSE", 40)],
-            "PASSPORT": [("PASSPORT", 60), ("REPUBLIC OF INDIA", 50)],
+                                ("DRIVING LICENSE", 40),
+                                # Vehicle Registration Certificate (RC card)
+                                # — issued by the RTO and treated by the
+                                # frontend under the same 'license' bucket.
+                                ("REGISTRATION CERTIFICATE", 60),
+                                ("VEHICLE CLASS", 50), ("CHASSIS", 40),
+                                ("ENGINE/MOTOR", 40), ("MAKER", 30),
+                                ("FORM 23A", 60), ("REGN NO", 50),
+                                ("REGN. NUMBER", 50),
+                                ("TRANSPORT DEPARTMENT", 50)],
+            "PASSPORT": [("PASSPORT", 60), ("REPUBLIC OF INDIA", 50),
+                         ("GIVEN NAME", 25), ("DATE OF EXPIRY", 25),
+                         ("PLACE OF ISSUE", 25),
+                         # Back-side keywords (no MRZ on back — these are
+                         # what makes the back identifiable as a passport
+                         # rather than e.g. a driving licence whose number
+                         # format collides with the passport File No).
+                         ("NAME OF FATHER", 60), ("NAME OF MOTHER", 60),
+                         ("NAME OF SPOUSE", 40), ("LEGAL GUARDIAN", 40),
+                         ("OLD PASSPORT", 60), ("FILE NO", 50)],
         }
         for doc, vals in signatures.items():
             for keyword, weight in vals:
-                if keyword in text:
+                kw_ns = re.sub(r"\s+", "", keyword)
+                if keyword in text or kw_ns in nospace:
                     scores[doc] += weight
 
-        if re.search(r"[A-Z]{3}\d{7}", text):          scores["VOTER_ID"] += 50
+        # Voter EPIC pattern — strict word boundaries so we don't match
+        # the 'FCS' fragment inside a chassis number like ME3J3C5FCS2016714.
+        if re.search(r"(?<![A-Z0-9])[A-Z]{3}\d{7}(?![A-Z0-9])", text):
+            scores["VOTER_ID"] += 50
         if re.search(r"[A-Z]{2}\d{2}\s?\d{11}", text):  scores["DRIVING_LICENSE"] += 60
         if re.search(r"[A-Z]{5}[0-9]{4}[A-Z]", text):   scores["PAN"] += 50
         if re.search(r"\d{4}\s?\d{4}\s?\d{4}", text):   scores["AADHAAR"] += 50
+
+        # Passport MRZ line is a very strong, format-specific signal.
+        if re.search(r"P<[A-Z]{3}", text) or re.search(r"P<<[A-Z]", text):
+            scores["PASSPORT"] += 80
+        # Indian passport number — 1-2 letters + 6-7 digits as a whole token.
+        if re.search(r"\b[A-Z]{1,2}\d{6,7}\b", text):
+            scores["PASSPORT"] += 30
 
         print("CLASS SCORES:", scores)
         top = max(scores, key=scores.get)
@@ -336,16 +398,19 @@ class DocumentPipeline:
             "status": "FAILED", "actual_type": "UNKNOWN",
             "ocr_engine": "rapidocr", "ocr_avg_confidence": None,
             "ocr_decision_reason": "", "extracted_text": "",
+            "output_json": None,
         }
         if not self.ocr_available:
             result["message"] = "OCR backend unavailable"
+            result["output_json"] = failure_envelope(
+                "OCR backend unavailable", status=503)
             return result
 
         # ── preprocess: crop → deskew → orient ──
         img = self.load_document_image(path)
         cropped, _ = auto_crop_document(img)
         desk, _ = deskew(cropped)
-        angle = self._detect_orientation(desk)
+        angle = await self._detect_orientation(desk)
         work = resize_for_ocr(rotate_image(desk, angle),
                               max_side=self.settings.work_max_side)
 
@@ -371,12 +436,14 @@ class DocumentPipeline:
 
         if actual != intended:
             result["message"] = f"Expected {intended}, got {actual}"
+            result["output_json"] = failure_envelope(result["message"])
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
         extracted = self.verify_and_extract(full_text, actual)
         if not extracted:
             result["message"] = "ID extraction failed"
+            result["output_json"] = failure_envelope(result["message"])
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
@@ -391,6 +458,7 @@ class DocumentPipeline:
             "extracted_id": extracted,
             "masked_id": self.mask_id(extracted, actual),
             "masked_image_file": masked,
+            "output_json": build_output_json(actual, region_results, full_text),
             "elapsed_sec": round(time.time() - t0, 3),
         })
         return result
@@ -402,7 +470,7 @@ class DocumentPipeline:
         cropped, crop_dbg = auto_crop_document(img)
         desk, desk_dbg = deskew(cropped)
         self._ensure_ocr()
-        angle = self._detect_orientation(desk)
+        angle = asyncio.run(self._detect_orientation(desk))
         work = resize_for_ocr(rotate_image(desk, angle),
                               max_side=self.settings.work_max_side)
         regions = self.layout.detect(work) if self.layout else []

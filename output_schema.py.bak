@@ -1,0 +1,707 @@
+"""Build the response JSON contract for downstream consumers.
+
+The pipeline gives us per-region OCR results (text + confidence + bbox).
+This module turns that into the document-type-specific JSON shape the
+frontend expects.
+
+Field extraction here is heuristic: we use regex over the joined text
+where possible and fall back to layout-aware label→value rules. Anything
+we can't recover confidently is emitted as an empty value with
+confidence 0 so the JSON shape itself stays stable.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Envelope helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _conf(confidence: Optional[float]) -> int:
+    """Scale a 0..1 OCR score to a 0..100 integer.
+
+    The frontend wants the genuine OCR-reported confidence, so this is the
+    region-level score that actually produced the value — no fabrication."""
+    return int(round(float(confidence or 0.0) * 100.0))
+
+
+def _field(value: str, confidence: Optional[float],
+           **extra) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"value": value or "",
+                           "confidence": _conf(confidence)}
+    out.update(extra)
+    return out
+
+
+def _envelope(data: Dict[str, Any], *, success: bool = True,
+              status: int = 200, message: Optional[str] = None,
+              message_code: str = "success") -> Dict[str, Any]:
+    return {
+        "data": data,
+        "status_code": status,
+        "message_code": message_code,
+        "message": message,
+        "success": success,
+    }
+
+
+def failure_envelope(message: str, *, status: int = 400) -> Dict[str, Any]:
+    return _envelope({}, success=False, status=status,
+                     message=message, message_code="failed")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Region helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _order(regions: List[Dict]) -> List[Dict]:
+    """Reading order — top-to-bottom, then left-to-right."""
+    return sorted(regions, key=lambda r: (r["region"].bbox[1],
+                                          r["region"].bbox[0]))
+
+
+def _conf_for(regions: List[Dict], needle: str,
+              default: float = 0.0) -> float:
+    """Confidence of the region whose text contains `needle`."""
+    if not needle:
+        return default
+    key = re.sub(r"\s+", "", needle).upper()
+    for r in regions:
+        if key and key in re.sub(r"\s+", "", r["text"]).upper():
+            return r["conf"]
+    return default
+
+
+def _find_region_idx(regions: List[Dict], pattern: str) -> int:
+    rx = re.compile(pattern, re.I)
+    for i, r in enumerate(regions):
+        if rx.search(r["text"]):
+            return i
+    return -1
+
+
+def _yyyy_mm_dd(dmy: str) -> str:
+    """Convert 'DD/MM/YYYY' (or with - / .) to 'YYYY-MM-DD'. Returns input on failure."""
+    m = re.match(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", dmy)
+    if not m:
+        return dmy
+    d, mo, y = m.groups()
+    return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
+def _yymmdd_to_dmy(s: str) -> str:
+    """Convert MRZ 'YYMMDD' to 'DD/MM/YYYY'. The MRZ century pivot at 30
+    matches Indian passports issued from the 2000s onward."""
+    if not re.fullmatch(r"\d{6}", s):
+        return ""
+    yy, mo, d = int(s[:2]), int(s[2:4]), int(s[4:6])
+    year = 2000 + yy if yy <= 30 else 1900 + yy
+    return f"{d:02d}/{mo:02d}/{year}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PAN
+# ──────────────────────────────────────────────────────────────────────────────
+
+PAN_LABEL_TOKENS = re.compile(
+    r"INCOME|TAX|DEPART|GOVT|GOVERNMENT|PERMANENT|ACCOUNT|NUMBER|NAME|"
+    r"FATHER|PARENT|DATE|BIRTH|SIGNATURE|SAMPLE|IMMIHELP",
+    re.I,
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """PAN names print in ALL CAPS, so reject anything mixed-case — that
+    filters OCR-garbage tokens like 'Hteak' that happen to fall between
+    the real name and father-name lines."""
+    t = text.strip()
+    if len(t) < 3 or any(ch.isdigit() for ch in t):
+        return False
+    if PAN_LABEL_TOKENS.search(t):
+        return False
+    letters = [ch for ch in t if ch.isalpha()]
+    if len(letters) < 3:
+        return False
+    upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    return upper_ratio > 0.85
+
+
+def build_pan(regions: List[Dict], full_text: str) -> Dict[str, Any]:
+    ordered = _order(regions)
+
+    pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]", full_text.upper())
+    pan_num = pan_match.group() if pan_match else ""
+
+    dob_match = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
+    dob = dob_match.group(1) if dob_match else ""
+
+    # Two name lines (Name, Father's Name) appear ABOVE the DOB in reading order.
+    full_name = father_name = ""
+    fn_conf = par_conf = 0.0
+    dob_idx = next((i for i, r in enumerate(ordered) if dob and dob in r["text"]),
+                   -1)
+    if dob_idx > 0:
+        names: List[Dict] = []
+        for j in range(dob_idx - 1, -1, -1):
+            if _looks_like_name(ordered[j]["text"]):
+                names.append(ordered[j])
+            if len(names) == 2:
+                break
+        # names is bottom→top; bottom one (closest to DOB) is father, top one is full
+        if len(names) >= 1:
+            father_name = names[0]["text"].title()
+            par_conf = names[0]["conf"]
+        if len(names) >= 2:
+            full_name = names[1]["text"].title()
+            fn_conf = names[1]["conf"]
+
+    data = {
+        "client_id": _client_id("pan_photo"),
+        "ocr_fields": [{
+            "document_type": "pan",
+            "pan_number": _field(pan_num, _conf_for(regions, pan_num)),
+            "full_name": _field(full_name, fn_conf),
+            "father_name": _field(father_name, par_conf),
+            "dob": _field(dob, _conf_for(regions, dob)),
+        }],
+    }
+    return _envelope(data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Aadhaar
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _aadhaar_dob(full_text: str) -> Tuple[str, bool]:
+    """Return (YYYY-MM-DD, yob_only_flag)."""
+    m = re.search(r"DOB[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
+    if m:
+        return _yyyy_mm_dd(m.group(1)), False
+    m = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[:\s]*(\d{4})", full_text, re.I)
+    if m:
+        return m.group(1), True
+    m = re.search(r"\b([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})\b", full_text)
+    if m:
+        return _yyyy_mm_dd(m.group(1)), False
+    return "", False
+
+
+_AADHAAR_LABELS = re.compile(
+    r"DOB|YEAR|MALE|FEMALE|GOVERNMENT|INDIA|AADHAAR|UIDAI|AUTHORITY|UNIQUE|"
+    r"IDENTIFICATION|ADDRESS|MOBILE|HELP|INFORMATION|SCANNING|VERIFIED|"
+    r"ENROL|PROOF|CITIZENSHIP|DATE|BIRTH|ISSUED|MERA|XML|CODE|SCANNED",
+    re.I,
+)
+
+
+def _looks_like_aadhaar_name(text: str) -> bool:
+    """A plausible Aadhaar name token. RapidOCR often runs words together
+    ('JAYVERMA') so single tokens are accepted as long as they are mostly
+    letters and don't hit a known label keyword."""
+    t = text.strip()
+    if not t or len(t) < 4 or any(ch.isdigit() for ch in t):
+        return False
+    if _AADHAAR_LABELS.search(t):
+        return False
+    letters = sum(ch.isalpha() for ch in t)
+    return letters >= 4 and letters / len(t) > 0.8
+
+
+def _aadhaar_name(ordered: List[Dict], dob_raw: str) -> Tuple[str, float]:
+    """Prefer the name token directly above the DOB; otherwise fall back to
+    the first plausible name token in reading order."""
+    if dob_raw:
+        dob_idx = next((i for i, r in enumerate(ordered)
+                        if dob_raw in r["text"]), -1)
+        if dob_idx > 0:
+            for j in range(dob_idx - 1, -1, -1):
+                if _looks_like_aadhaar_name(ordered[j]["text"]):
+                    return (ordered[j]["text"].strip().title(),
+                            ordered[j]["conf"])
+    for r in ordered:
+        if _looks_like_aadhaar_name(r["text"]):
+            return r["text"].strip().title(), r["conf"]
+    return "", 0.0
+
+
+def _aadhaar_address(ordered: List[Dict]) -> Tuple[str, float, str, str]:
+    """Return (address_string, conf, zip, care_of). The address starts at
+    the 'Address:' / 'पता:' marker and runs to the trailing 6-digit PIN."""
+    addr_idx = next((i for i, r in enumerate(ordered)
+                     if re.search(r"ADDRESS", r["text"], re.I)), -1)
+    if addr_idx < 0:
+        return "", 0.0, "", ""
+
+    parts: List[str] = []
+    confs: List[float] = []
+    for r in ordered[addr_idx + 1:]:
+        t = r["text"].strip()
+        if not t:
+            continue
+        if re.search(r"AADHAAR|UIDAI|MOBILE|HELP|WWW|VID|ENROL", t, re.I):
+            break
+        parts.append(t)
+        confs.append(r["conf"])
+
+    full = ", ".join(parts).strip(" ,")
+    zipm = re.search(r"\b(\d{6})\b", full)
+    pin = zipm.group(1) if zipm else ""
+
+    co = re.search(r"(?:C/O|S/O|D/O|W/O)[:\s]*([A-Za-z][A-Za-z\s]+?)(?:,|House|$)",
+                   full, re.I)
+    care_of = co.group(1).strip().title() if co else ""
+
+    conf = sum(confs) / len(confs) if confs else 0.0
+    return full, conf, pin, care_of
+
+
+def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
+    ordered = _order(regions)
+
+    # ── identity side ──
+    num_match = re.search(r"(?<!\d)(\d{4}\s?\d{4}\s?\d{4})(?!\d)", full_text)
+    aadhaar_num = re.sub(r"\s+", "", num_match.group(1)) if num_match else ""
+    a_conf = _conf_for(regions, aadhaar_num)
+
+    dob_raw_match = re.search(
+        r"(?:DOB[:\s]*)?([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text)
+    dob_raw = dob_raw_match.group(1) if dob_raw_match else ""
+    dob_val, yob_only = _aadhaar_dob(full_text)
+    dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0
+
+    gender = ""
+    g_conf = 0.0
+    gm = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", full_text, re.I)
+    if gm:
+        gender = {"male": "M", "female": "F",
+                  "transgender": "T"}[gm.group(1).lower()]
+        g_conf = _conf_for(regions, gm.group(1))
+
+    full_name, name_conf = _aadhaar_name(ordered, dob_raw)
+    uniq = hashlib.sha256(
+        (aadhaar_num or full_text[:64]).encode()).hexdigest()
+
+    front = {
+        "document_type": "aadhaar_front_bottom",
+        "full_name": _field(full_name, name_conf),
+        "gender": _field(gender, g_conf),
+        "mother_name": _field("", 0.0),
+        "father_name": _field("", 0.0),
+        "dob": {"value": dob_val, "confidence": _conf(dob_conf),
+                "yob": yob_only},
+        "aadhaar_number": {"value": aadhaar_num, "confidence": _conf(a_conf),
+                            "is_masked": False, "input_validation": False},
+        "image_url": None,
+        "uniqueness_id": uniq,
+    }
+
+    # ── address side ──
+    addr, addr_conf, pin, care_of = _aadhaar_address(ordered)
+    back = {
+        "document_type": "aadhaar_back",
+        "address": {
+            "value": addr, "confidence": _conf(addr_conf),
+            "first_line": "", "second_line": "", "locality": "",
+            "landmark": "", "house_number": "",
+            "district": "", "city": "", "state": "", "country": "",
+            "zip": pin,
+        },
+        "zip": _field(pin, addr_conf),
+        "care_of": {"value": care_of, "confidence": _conf(addr_conf),
+                    "relation": "care_of"},
+        "aadhaar_number": {"value": aadhaar_num, "confidence": _conf(a_conf),
+                            "is_masked": False, "input_validation": False},
+        "image_url": None,
+    }
+
+    fields: List[Dict[str, Any]] = [front]
+    if addr or pin or care_of:
+        fields.append(back)
+
+    return _envelope({
+        "client_id": _client_id("ocr_aadhaar"),
+        "ocr_fields": fields,
+    })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Passport
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _mrz_lines(full_text: str) -> Tuple[str, str]:
+    """Extract MRZ line 1 (P<...) and line 2 (passport_num<...)."""
+    txt = full_text.upper()
+    nospace_per_line = [re.sub(r"\s+", "", ln) for ln in txt.split("\n") if ln.strip()]
+    line1 = next((ln for ln in nospace_per_line
+                  if re.match(r"P[A-Z<]<", ln) and "<" in ln), "")
+    line2 = next((ln for ln in nospace_per_line
+                  if re.match(r"[A-Z]\d{6,7}<", ln)), "")
+    return line1, line2
+
+
+def _split_mrz_line1(line1: str) -> Tuple[str, str, str, str]:
+    """Return (type, country_code, surname, given). Handles the case where
+    the country-code positions are filler `<<<` (e.g. on specimen passports)
+    by skipping leading `<` chars after the type."""
+    if not line1 or len(line1) < 5:
+        return "", "", "", ""
+    type_ = line1[0]
+    tail = line1[2:]
+    country = ""
+    if len(tail) >= 3 and tail[:3].isalpha():
+        country, tail = tail[:3], tail[3:]
+    else:
+        tail = tail.lstrip("<")
+    parts = [p for p in tail.split("<<") if p]
+    surname = (parts[0].replace("<", " ").strip().title()
+               if parts else "")
+    given = (parts[1].replace("<", " ").strip().title()
+             if len(parts) > 1 else "")
+    return type_, country, surname, given
+
+
+def _split_mrz_line2(line2: str) -> Tuple[str, str, str, str, str]:
+    """Return (passport_num, country, dob_yymmdd, sex, doe_yymmdd).
+    Tolerant of 0-2 check digits between fields."""
+    if not line2:
+        return "", "", "", "", ""
+    pm = re.match(r"([A-Z]\d{6,7})", line2)
+    pnum = pm.group(1) if pm else ""
+    m = re.search(r"([A-Z]{3})(\d{6})\d?([MF<])(\d{6})", line2)
+    if not m:
+        return pnum, "", "", "", ""
+    return (pnum,) + m.groups()
+
+
+_BACK_LABEL_RX = re.compile(
+    r"NAME\s*OF|ADDRESS|LEGAL\s*GUARDIAN|OLD\s*PASSPORT|FILE\s*NO|"
+    r"FATHER|MOTHER|SPOUSE|REPUBLIC|GIVEN\s*NAME|DATE\s*OF|PLACE\s*OF|"
+    r"PASSPORT",
+    re.I,
+)
+
+
+def _label_value_before(ordered: List[Dict], label_pattern: str
+                        ) -> Tuple[str, float]:
+    """Passport-back layout prints each name ABOVE its label
+    ('SUKESH VERMA' / 'Name of Father'). Only the IMMEDIATELY adjacent
+    non-empty line is the value — don't walk past another label, or we'd
+    borrow the previous field's value (e.g. give 'Name of Spouse' the
+    mother's name)."""
+    rx = re.compile(label_pattern, re.I)
+    for i, r in enumerate(ordered):
+        if rx.search(r["text"]):
+            for j in range(i - 1, -1, -1):
+                t = ordered[j]["text"].strip()
+                if not t:
+                    continue
+                if _BACK_LABEL_RX.search(t) or any(ch.isdigit() for ch in t):
+                    return "", 0.0
+                return t.title(), ordered[j]["conf"]
+            break
+    return "", 0.0
+
+
+def _label_value_after(ordered: List[Dict], label_pattern: str
+                       ) -> Tuple[str, float]:
+    """Address / File No / Old Passport: value follows the label.
+    Only the immediately adjacent non-empty line is taken."""
+    rx = re.compile(label_pattern, re.I)
+    for i, r in enumerate(ordered):
+        if rx.search(r["text"]):
+            for j in range(i + 1, len(ordered)):
+                t = ordered[j]["text"].strip()
+                if not t:
+                    continue
+                if _BACK_LABEL_RX.search(t):
+                    return "", 0.0
+                return t.strip(), ordered[j]["conf"]
+            break
+    return "", 0.0
+
+
+def _passport_back_address(ordered: List[Dict]
+                           ) -> Tuple[str, float, Dict[str, str]]:
+    """Collect every region between the 'Address' label and the
+    'Old Passport' / 'File No' markers; parse out city / state / zip.
+    Stopper includes 'PASSP' so OCR garbage like 'LDPASSPOWDATANDPLACEFSE'
+    (the mangled 'Old Passport No with Date and Place of Issue' label)
+    is correctly recognised as the end of the address block."""
+    start = next((i for i, r in enumerate(ordered)
+                  if re.search(r"ADDRESS", r["text"], re.I)), -1)
+    if start < 0:
+        return "", 0.0, {}
+
+    stoppers = re.compile(r"OLD\s*PASSPORT|FILE\s*NO|PASSP|FATHER|MOTHER|"
+                          r"SPOUSE|LEGAL\s*GUARDIAN", re.I)
+    parts, confs = [], []
+    for r in ordered[start + 1:]:
+        t = r["text"].strip()
+        if not t:
+            continue
+        if stoppers.search(t):
+            break
+        parts.append(t)
+        confs.append(r["conf"])
+
+    full = ", ".join(parts).strip(" ,")
+    components: Dict[str, str] = {"house_number": "", "locality": "",
+                                  "city": "", "district": "", "state": "",
+                                  "country": "", "zip": ""}
+    if not full:
+        return "", 0.0, components
+
+    pin = re.search(r"PIN[:\s]*([0-9]{6})|\b([0-9]{6})\b", full)
+    components["zip"] = (pin.group(1) or pin.group(2)) if pin else ""
+    if "INDIA" in full.upper():
+        components["country"] = "INDIA"
+    for state in ("PUNJAB", "HARYANA", "DELHI", "MAHARASHTRA", "GUJARAT",
+                  "KARNATAKA", "TAMIL NADU", "KERALA", "RAJASTHAN",
+                  "UTTAR PRADESH", "WEST BENGAL", "ANDHRA PRADESH",
+                  "TELANGANA", "MADHYA PRADESH", "BIHAR", "ODISHA",
+                  "ASSAM", "JHARKHAND", "CHHATTISGARH", "UTTARAKHAND"):
+        if state in full.upper():
+            components["state"] = state
+            break
+
+    return full, sum(confs) / len(confs), components
+
+
+def _looks_like_passport_name(text: str) -> bool:
+    """ALL-CAPS person-name line on the passport back."""
+    t = text.strip()
+    if len(t) < 4 or any(ch.isdigit() for ch in t):
+        return False
+    if re.search(r"NAME\s*OF|ADDRESS|GUARDIAN|FATHER|MOTHER|SPOUSE|"
+                 r"FILE\s*NO|OLD\s*PASSPORT|PASSP|REPUBLIC|INDIA|"
+                 r"PUNJAB|HARYANA|DELHI|MAHARASHTRA|BLOCK|AEROCITY|"
+                 r"NAGAR|MOHALI|PIN", t, re.I):
+        return False
+    letters = [ch for ch in t if ch.isalpha()]
+    if len(letters) < 4:
+        return False
+    upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    return upper_ratio > 0.85
+
+
+def _passport_back_names(ordered: List[Dict]
+                          ) -> Tuple[Tuple[str, float],
+                                     Tuple[str, float],
+                                     Tuple[str, float]]:
+    """Father / Mother / Spouse names sit ABOVE the Address block in a
+    fixed printed order on the Indian passport. The labels above each
+    name are often dropped or garbled by OCR — so we don't anchor on
+    them. Take the first 1-3 ALL-CAPS name-like lines that appear
+    before the 'Address' marker."""
+    addr_idx = next((i for i, r in enumerate(ordered)
+                     if re.search(r"ADDRESS", r["text"], re.I)),
+                    len(ordered))
+    picks: List[Tuple[str, float]] = []
+    for r in ordered[:addr_idx]:
+        if _looks_like_passport_name(r["text"]):
+            picks.append((r["text"].strip().title(), r["conf"]))
+        if len(picks) == 3:
+            break
+    while len(picks) < 3:
+        picks.append(("", 0.0))
+    return picks[0], picks[1], picks[2]
+
+
+def _build_passport_back(regions: List[Dict],
+                         full_text: str) -> Dict[str, Any]:
+    ordered = _order(regions)
+    up = full_text.upper()
+
+    fn = re.search(r"\b([A-Z]{2}\d{13,14})\b", up)
+    file_no = fn.group(1) if fn else ""
+    f_conf = _conf_for(regions, file_no)
+
+    # The barcode print under the passport number gives us the passport ID.
+    pn = re.search(r"\b([A-Z]\d{7}|[A-Z]{2}\d{6,7})\b", up)
+    passport_num = pn.group(1) if pn else ""
+    p_conf = _conf_for(regions, passport_num)
+
+    (father, fa_conf), (mother, mo_conf), (spouse, sp_conf) = \
+        _passport_back_names(ordered)
+    old_pass, op_conf = _label_value_after(ordered, r"OLD\s*PASSPORT")
+
+    addr_text, addr_conf, comps = _passport_back_address(ordered)
+
+    data = {
+        "client_id": _client_id("ocr_passport"),
+        "ocr_fields": [{
+            "document_type": "passport_back",
+            "file_number": _field(file_no, f_conf),
+            "passport_num": _field(passport_num, p_conf),
+            "father_name": _field(father, fa_conf),
+            "mother_name": _field(mother, mo_conf),
+            "spouse_name": _field(spouse, sp_conf),
+            "old_passport_no": _field(old_pass, op_conf),
+            "address": {
+                "value": addr_text,
+                "confidence": _conf(addr_conf),
+                **comps,
+            },
+        }],
+    }
+    return _envelope(data)
+
+
+def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
+    # Back side has no MRZ; identify it by labels unique to the back.
+    nospace = re.sub(r"\s+", "", full_text.upper())
+    back_hits = sum(k in nospace for k in (
+        "NAMEOFFATHER", "NAMEOFMOTHER", "NAMEOFSPOUSE",
+        "OLDPASSPORT", "FILENO", "LEGALGUARDIAN",
+    ))
+    if back_hits >= 2:
+        return _build_passport_back(regions, full_text)
+
+    line1, line2 = _mrz_lines(full_text)
+    type_of, country_l1, surname, given = _split_mrz_line1(line1)
+    passport_num, country_l2, dob_mrz, gender_mrz, doe_mrz = \
+        _split_mrz_line2(line2)
+    country_code = country_l2 or country_l1
+    dob = _yymmdd_to_dmy(dob_mrz)
+    doe = _yymmdd_to_dmy(doe_mrz)
+
+    # Fallback to labelled fields when the MRZ second line is malformed.
+    if not dob:
+        m = re.search(r"DATE\s*OF\s*BIRTH[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
+                      full_text, re.I)
+        if m:
+            dob = m.group(1)
+    if not doe:
+        m = re.search(r"DATE\s*OF\s*EXPIRY[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
+                      full_text, re.I)
+        if m:
+            doe = m.group(1)
+    if not gender_mrz:
+        m = re.search(r"\b(MALE|FEMALE)\b", full_text, re.I)
+        if m:
+            gender_mrz = "M" if m.group(1).upper() == "MALE" else "F"
+
+    # ── from labeled lines ──
+    nationality = "INDIAN" if country_code == "IND" else ""
+    doi_m = re.search(r"DATE\s*OF\s*ISSUE[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
+                      full_text, re.I)
+    doi = doi_m.group(1) if doi_m else ""
+    pob_m = re.search(r"PLACE\s*OF\s*BIRTH[:\s]*([A-Z, ]+)", full_text, re.I)
+    pob = pob_m.group(1).strip().rstrip(",").upper() if pob_m else ""
+    poi_m = re.search(r"PLACE\s*OF\s*ISSUE[:\s]*([A-Z, ]+)", full_text, re.I)
+    poi = poi_m.group(1).strip().rstrip(",").upper() if poi_m else ""
+
+    # Fallback for passport number from a labelled token in the body.
+    if not passport_num:
+        bm = re.search(r"\b([A-Z]\d{7})\b", full_text)
+        passport_num = bm.group(1) if bm else ""
+
+    base_conf = _conf_for(regions, passport_num,
+                          default=_conf_for(regions, line1[:8]) if line1 else 0.0)
+    g = {"M": "M", "F": "F"}.get(gender_mrz, "")
+
+    data = {
+        "client_id": _client_id("ocr_passport"),
+        "ocr_fields": [{
+            "document_type": "passport_front",
+            "country_code": _field(country_code, base_conf),
+            "dob": _field(dob, base_conf),
+            "doe": _field(doe, base_conf),
+            "doi": _field(doi, _conf_for(regions, doi)),
+            "gender": _field(g, base_conf),
+            "given_name": _field(given, base_conf),
+            "nationality": _field(nationality, base_conf),
+            "passport_num": _field(passport_num, base_conf),
+            "place_of_birth": _field(pob, _conf_for(regions, pob)),
+            "place_of_issue": _field(poi, _conf_for(regions, poi)),
+            "surname": _field(surname, base_conf),
+            "mrz_line_1": _field(line1, base_conf),
+            "mrz_line_2": _field(line2, base_conf),
+            "type_of_passport": _field(type_of, base_conf),
+            "passport_validity": None,
+        }],
+    }
+    return _envelope(data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Driving License
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
+    up = full_text.upper()
+
+    # Real driving licence number — e.g. HR41 20220002435.
+    lm = re.search(r"([A-Z]{2}\d{2}\s?\d{11})", up)
+    license_num = lm.group(1) if lm else ""
+
+    # Vehicle Registration Certificate fallback — e.g. CH01CY1547.
+    # The frontend pools RCs and DLs into the same 'license' bucket.
+    if not license_num:
+        rcm = re.search(r"\b([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5})\b", up)
+        if rcm:
+            license_num = rcm.group(1)
+
+    l_conf = _conf_for(regions, license_num)
+
+    dm = re.search(r"\b([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})\b", full_text)
+    dob_raw = dm.group(1) if dm else ""
+    dob_val = _yyyy_mm_dd(dob_raw) if dob_raw else ""
+    dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0
+
+    data = {
+        "client_id": _client_id("ocr_license"),
+        "document_type": None,
+        "license_number": _field(license_num, l_conf),
+        "dob": {"value": dob_val, "confidence": _conf(dob_conf),
+                "yob": False},
+        "image_url": None,
+    }
+    return _envelope(data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Voter ID (kept for parity with the pipeline's doc-type list)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_voter(regions: List[Dict], full_text: str) -> Dict[str, Any]:
+    vm = re.search(r"([A-Z]{3}\d{7})", full_text.upper())
+    epic = vm.group(1) if vm else ""
+    v_conf = _conf_for(regions, epic)
+
+    dm = re.search(r"\b([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})\b", full_text)
+    dob = dm.group(1) if dm else ""
+
+    data = {
+        "client_id": _client_id("ocr_voter"),
+        "ocr_fields": [{
+            "document_type": "voter_id",
+            "epic_number": _field(epic, v_conf),
+            "dob": _field(dob, _conf_for(regions, dob)),
+        }],
+    }
+    return _envelope(data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Top-level dispatch
+# ──────────────────────────────────────────────────────────────────────────────
+
+_BUILDERS = {
+    "PAN": build_pan,
+    "AADHAAR": build_aadhaar,
+    "PASSPORT": build_passport,
+    "DRIVING_LICENSE": build_license,
+    "VOTER_ID": build_voter,
+}
+
+
+def build_output_json(doc_type: str, regions: List[Dict],
+                      full_text: str) -> Dict[str, Any]:
+    builder = _BUILDERS.get(doc_type)
+    if builder is None:
+        return failure_envelope(f"unsupported document type: {doc_type}")
+    return builder(regions, full_text)

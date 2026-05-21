@@ -53,10 +53,36 @@ def enhance_for_ocr(img_bgr: np.ndarray) -> dict:
     return {"color": color, "gray": sharp, "bin": bin_img}
 
 
-def auto_crop_document(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
+def auto_crop_document(
+    img_bgr: np.ndarray,
+    min_keep_ratio: float = 0.70,
+    margin_edge_thresh: float = 0.015,
+    pad_ratio: float = 0.012,
+) -> tuple[np.ndarray, dict]:
     """Attempt to find the document contour and crop to it.
 
-    Returns (cropped_image, debug_info). If no good contour is found, returns original.
+    A crop is only accepted when it is *safe* — i.e. it does not throw away
+    real document content. Canny on a light card over a light background
+    routinely latches onto a partial inner contour, and a crop to that box
+    silently amputates part of the card (the bottom strip carrying the ID
+    number, a slogan band, etc.). Two guards prevent that:
+
+      * keep-area guard — the padded crop must retain at least
+        `min_keep_ratio` of the original image area; a contour covering
+        only part of the card is rejected outright.
+      * margin-content guard — every strip the crop would discard is
+        checked for edge density. A blank photo border has almost no
+        edges; a discarded strip whose edge fraction exceeds
+        `margin_edge_thresh` still carries text/graphics, meaning the
+        contour is cutting *into* the document — so the crop is rejected.
+
+    The detected box is also padded outward by `pad_ratio` so a slightly
+    tight contour never shaves off characters.
+
+    Returns (cropped_or_original, debug_info). When no contour passes the
+    guards the original image is returned unchanged — over-cropping
+    destroys OCR input, so falling back to the full frame is the safe
+    failure mode.
     """
     img = img_bgr
     h, w = img.shape[:2]
@@ -65,22 +91,39 @@ def auto_crop_document(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
     # Work on a downsized image for contour detection.
     scale = 800.0 / max(h, w) if max(h, w) > 800 else 1.0
     small = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape[:2]
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
 
-    # Close gaps in edges
+    # Close gaps for contour finding. Keep the *raw* `edges` map intact —
+    # it is what the margin-content guard measures.
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return img_bgr, debug
 
+    def _strip_edge_fraction(y1: int, y2: int, x1: int, x2: int) -> float:
+        """Edge density of a discarded strip in the raw-edge map.
+
+        Returns 0 for strips too thin to matter (the padding ring) so a
+        few-pixel border never trips the content guard."""
+        if y2 <= y1 or x2 <= x1:
+            return 0.0
+        strip = edges[y1:y2, x1:x2]
+        if strip.size < 0.01 * sh * sw:
+            return 0.0
+        return float(np.count_nonzero(strip)) / float(strip.size)
+
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    pad_x = int(round(sw * pad_ratio))
+    pad_y = int(round(sh * pad_ratio))
+
     for cnt in contours[:5]:
         area = cv2.contourArea(cnt)
-        if area < 0.15 * (small.shape[0] * small.shape[1]):
+        if area < 0.15 * (sh * sw):
             continue
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
@@ -88,25 +131,49 @@ def auto_crop_document(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
             continue
 
         x, y, ww, hh = cv2.boundingRect(approx)
-        debug.update({"contour_found": True, "bbox_small": (int(x), int(y), int(ww), int(hh))})
+        # Pad the box outward so a tight contour never clips characters.
+        sx1 = max(0, x - pad_x)
+        sy1 = max(0, y - pad_y)
+        sx2 = min(sw, x + ww + pad_x)
+        sy2 = min(sh, y + hh + pad_y)
 
-        # Scale bbox back to original size.
-        x1 = int(x / scale)
-        y1 = int(y / scale)
-        x2 = int((x + ww) / scale)
-        y2 = int((y + hh) / scale)
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w, x2)
-        y2 = min(h, y2)
+        keep_ratio = ((sx2 - sx1) * (sy2 - sy1)) / float(sh * sw)
+        margins = {
+            "top":    _strip_edge_fraction(0,   sy1, 0,   sw),
+            "bottom": _strip_edge_fraction(sy2, sh,  0,   sw),
+            "left":   _strip_edge_fraction(sy1, sy2, 0,   sx1),
+            "right":  _strip_edge_fraction(sy1, sy2, sx2, sw),
+        }
+        worst_margin = max(margins.values())
+        debug.update({
+            "contour_found": True,
+            "bbox_small": (int(x), int(y), int(ww), int(hh)),
+            "keep_ratio": round(keep_ratio, 3),
+            "margin_edges": {k: round(v, 4) for k, v in margins.items()},
+        })
 
-        if (x2 - x1) * (y2 - y1) < 0.2 * (w * h):
+        # Reject crops that drop too much area or cut into real content.
+        if keep_ratio < min_keep_ratio:
+            debug["reject_reason"] = (
+                f"keep_ratio {keep_ratio:.2f} < {min_keep_ratio}")
             continue
+        if worst_margin > margin_edge_thresh:
+            debug["reject_reason"] = (
+                f"discarded margin still has content "
+                f"(edge fraction {worst_margin:.3f} > {margin_edge_thresh})")
+            continue
+
+        # Scale the accepted box back to original resolution.
+        x1 = max(0, int(sx1 / scale))
+        y1 = max(0, int(sy1 / scale))
+        x2 = min(w, int(sx2 / scale))
+        y2 = min(h, int(sy2 / scale))
 
         cropped = img_bgr[y1:y2, x1:x2].copy()
         debug.update({"cropped": True, "bbox": (x1, y1, x2, y2)})
         return cropped, debug
 
+    debug.setdefault("reject_reason", "no contour passed the safety guards")
     return img_bgr, debug
 
 

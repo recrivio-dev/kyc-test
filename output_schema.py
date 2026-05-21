@@ -165,13 +165,24 @@ def _to_iso_date(s: str) -> str:
     return f"{y}-{mon:02d}-{int(d):02d}"
 
 
-def _yymmdd_to_dmy(s: str) -> str:
-    """Convert MRZ 'YYMMDD' to 'DD/MM/YYYY'. The MRZ century pivot at 30
-    matches Indian passports issued from the 2000s onward."""
+def _yymmdd_to_dmy(s: str, *, is_expiry: bool = False) -> str:
+    """Convert MRZ 'YYMMDD' to 'DD/MM/YYYY'.
+
+    The MRZ stores only a 2-digit year, so the century must be inferred:
+
+      * expiry dates are always in the future for a usable passport, so a
+        2-digit year maps unconditionally to the 2000s (yy '35' -> 2035).
+      * birth dates use a pivot at 30 — '00'-'30' -> 2000s,
+        '31'-'99' -> 1900s — matching Indian passports issued from the
+        2000s onward.
+    """
     if not re.fullmatch(r"\d{6}", s):
         return ""
     yy, mo, d = int(s[:2]), int(s[2:4]), int(s[4:6])
-    year = 2000 + yy if yy <= 30 else 1900 + yy
+    if is_expiry:
+        year = 2000 + yy
+    else:
+        year = 2000 + yy if yy <= 30 else 1900 + yy
     return f"{d:02d}/{mo:02d}/{year}"
 
 
@@ -556,10 +567,18 @@ def _mrz_lines(full_text: str) -> Tuple[str, str]:
     """Extract MRZ line 1 (P<...) and line 2 (passport_num<...)."""
     txt = full_text.upper()
     nospace_per_line = [re.sub(r"\s+", "", ln) for ln in txt.split("\n") if ln.strip()]
+    # Line 1 starts with the document-type letter ('P' for passport) and
+    # carries the '<<' name separator. On a real passport the 3rd char is
+    # the first letter of the country code ('P<IND...') — filler '<' only
+    # appears on specimens — so don't pin the 3rd char to '<'.
     line1 = next((ln for ln in nospace_per_line
-                  if re.match(r"P[A-Z<]<", ln) and "<" in ln), "")
+                  if re.match(r"P[A-Z<]", ln) and "<<" in ln
+                  and len(ln) >= 28), "")
+    # Line 2 begins with the passport number: 1-2 letters then 6-7 digits
+    # (Indian passports use both 'A1234567' and 'AH386374' forms).
     line2 = next((ln for ln in nospace_per_line
-                  if re.match(r"[A-Z]\d{6,7}<", ln)), "")
+                  if re.match(r"[A-Z]{1,2}\d{6,7}", ln)
+                  and len(ln) >= 28), "")
     return line1, line2
 
 
@@ -588,7 +607,7 @@ def _split_mrz_line2(line2: str) -> Tuple[str, str, str, str, str]:
     Tolerant of 0-2 check digits between fields."""
     if not line2:
         return "", "", "", "", ""
-    pm = re.match(r"([A-Z]\d{6,7})", line2)
+    pm = re.match(r"([A-Z]{1,2}\d{6,7})", line2)
     pnum = pm.group(1) if pm else ""
     m = re.search(r"([A-Z]{3})(\d{6})\d?([MF<])(\d{6})", line2)
     if not m:
@@ -784,7 +803,7 @@ def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
         _split_mrz_line2(line2)
     country_code = country_l2 or country_l1
     dob = _yymmdd_to_dmy(dob_mrz)
-    doe = _yymmdd_to_dmy(doe_mrz)
+    doe = _yymmdd_to_dmy(doe_mrz, is_expiry=True)
 
     # Fallback to labelled fields when the MRZ second line is malformed.
     if not dob:
@@ -823,9 +842,10 @@ def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     poi_m = re.search(r"PLACE\s*OF\s*ISSUE[:\s]*([A-Z, ]+)", full_text, re.I)
     poi = poi_m.group(1).strip().rstrip(",").upper() if poi_m else ""
 
-    # Fallback for passport number from a labelled token in the body.
+    # Fallback for passport number from a token printed in the body —
+    # 1-2 letters + 6-7 digits, matching the Indian passport formats.
     if not passport_num:
-        bm = re.search(r"\b([A-Z]\d{7})\b", full_text)
+        bm = re.search(r"\b([A-Z]{1,2}\d{6,7})\b", full_text)
         passport_num = bm.group(1) if bm else ""
 
     base_conf = _conf_for(regions, passport_num,
@@ -901,13 +921,16 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 
     # Real driving licence number — e.g. 'HR41 20220002435'. No \b
     # boundary: DL numbers are often glued to their label in the OCR
-    # output ('DLNOHR4120220002435').
-    lm = re.search(r"([A-Z]{2}\d{2}\s?\d{11})", up)
+    # output ('DLNOHR4120220002435'). The state code is routinely printed
+    # with a hyphen/space separator ('MH-1220050000188'), so a `[\s-]?`
+    # separator is allowed between every token group.
+    lm = re.search(r"([A-Z]{2}[\s-]?\d{2}[\s-]?\d{11})", up)
     license_num = lm.group(1) if lm else ""
 
     # Vehicle Registration Certificate fallback — e.g. 'CH01CY1547'.
     if not license_num:
-        rcm = re.search(r"\b([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5})\b", up)
+        rcm = re.search(
+            r"\b([A-Z]{2}[\s-]?\d{1,2}[\s-]?[A-Z]{1,2}[\s-]?\d{3,5})\b", up)
         if rcm:
             license_num = rcm.group(1)
     l_conf = _conf_for(regions, license_num)

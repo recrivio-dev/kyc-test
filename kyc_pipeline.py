@@ -58,8 +58,12 @@ class DocumentPipeline:
             "PASSPORT": r"[A-Z]{1,2}\d{6,7}",
             # Real DL number OR Vehicle Registration Certificate number
             # (e.g. CH01CY1547). The frontend treats both under 'license'.
+            # The state code is routinely printed with a hyphen or space
+            # separator ("MH-1220050000188", "DL 04 20110149646"), so a
+            # `[\s-]?` separator is allowed between every token group.
             "DRIVING_LICENSE":
-                r"[A-Z]{2}\d{2}\s?\d{11}|[A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5}",
+                r"[A-Z]{2}[\s-]?\d{2}[\s-]?\d{11}"
+                r"|[A-Z]{2}[\s-]?\d{1,2}[\s-]?[A-Z]{1,2}[\s-]?\d{3,5}",
         }
 
     # ── Bootstrap ────────────────────────────────────────────────────────────
@@ -271,9 +275,14 @@ class DocumentPipeline:
         # the 'FCS' fragment inside a chassis number like ME3J3C5FCS2016714.
         if re.search(r"(?<![A-Z0-9])[A-Z]{3}\d{7}(?![A-Z0-9])", text):
             scores["VOTER_ID"] += 50
-        if re.search(r"[A-Z]{2}\d{2}\s?\d{11}", text):  scores["DRIVING_LICENSE"] += 60
+        if re.search(r"[A-Z]{2}[\s-]?\d{2}[\s-]?\d{11}", text):
+            scores["DRIVING_LICENSE"] += 60
         if re.search(r"[A-Z]{5}[0-9]{4}[A-Z]", text):   scores["PAN"] += 50
-        if re.search(r"\d{4}\s?\d{4}\s?\d{4}", text):   scores["AADHAAR"] += 50
+        # Anchored exactly like the AADHAAR extraction pattern: the
+        # (?<!\d)/(?!\d) guards stop a clean 12-digit run being matched
+        # inside a longer number (e.g. a 13-digit DL number).
+        if re.search(r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)", text):
+            scores["AADHAAR"] += 50
 
         # Passport MRZ line is a very strong, format-specific signal.
         if re.search(r"P<[A-Z]{3}", text) or re.search(r"P<<[A-Z]", text):

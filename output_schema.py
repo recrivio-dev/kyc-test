@@ -53,6 +53,59 @@ def failure_envelope(message: str, *, status: int = 400) -> Dict[str, Any]:
                      message=message, message_code="failed")
 
 
+# Common Indian surnames — used to recover the first/last-name boundary
+# in an all-caps glued OCR token ('RAHULGUPTA' → 'RAHUL GUPTA'), which
+# has neither a space nor a case change to split on. Longest entries are
+# tried first so 'AGGARWAL' wins over any shorter accidental suffix.
+_COMMON_SURNAMES = sorted((
+    "SRIVASTAVA", "BHARDWAJ", "AGARWAL", "AGGARWAL", "MALHOTRA", "CHATURVEDI",
+    "TRIPATHI", "SACHDEVA", "CHAUHAN", "RATHORE", "KULKARNI", "MUKHERJEE",
+    "CHATTERJEE", "BANERJEE", "DESHMUKH", "GAIKWAD", "WADHWA", "KAPOOR",
+    "KHANNA", "CHOPRA", "MEHROTRA", "PANDEY", "MISHRA", "TIWARI", "DUBEY",
+    "SHUKLA", "DWIVEDI", "SAXENA", "THAKUR", "SHARMA", "VERMA", "GUPTA",
+    "YADAV", "PATEL", "REDDY", "NAIDU", "PILLAI", "MEHTA", "BANSAL",
+    "MITTAL", "ARORA", "SETHI", "DESAI", "JOSHI", "MALIK", "PRASAD",
+    "CHANDRA", "NAHATA", "SINGHAL", "AGRAWAL", "GOENKA", "JAISWAL",
+    "SINHA", "GHOSH", "NAIR", "IYER", "MENON", "SHAH", "JAIN", "GOEL",
+    "GARG", "KHAN", "BOSE", "DASS", "NEGI", "RAWAT", "BISHT", "SIDHU",
+    "DHILLON", "SANDHU", "BAJWA", "GREWAL", "BHATIA", "ANAND", "GROVER",
+    "NANDA", "TANEJA", "NAGPAL", "RANA", "MEHRA", "KAUR", "GILL", "BRAR",
+    "SOOD", "SETH", "DAS", "SEN", "ROY", "RAO", "BHAT", "BHATT", "KUMAR",
+    "SINGH", "NATH",
+), key=len, reverse=True)
+
+
+def _split_glued_surname(token: str) -> str:
+    """Split an all-caps glued name on a trailing known surname.
+
+    'RAHULGUPTA' → 'RAHUL GUPTA'. Only fires when the remaining prefix is
+    a plausible given name (≥2 chars); a token that *is* exactly a
+    surname is left untouched."""
+    up = token.upper()
+    for sn in _COMMON_SURNAMES:
+        if up.endswith(sn) and len(up) - len(sn) >= 2:
+            return f"{token[:-len(sn)]} {token[-len(sn):]}"
+    return token
+
+
+def _clean_name(text: str) -> str:
+    """Normalise a person-name string.
+
+    OCR mangles the spacing between a first and last name three ways:
+      * it splits them across text lines      → 'JAY\\nVERMA'
+      * it glues them keeping the case change → 'JayVerma'
+      * it glues them in all-caps             → 'RAHULGUPTA'
+    Whitespace runs collapse to one space; a lowercase→uppercase boundary
+    becomes a space (a genuine intra-word capital is vanishingly rare in
+    Indian names); an all-caps glued token is split on a trailing known
+    surname since it offers no other boundary."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    t = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
+    if " " not in t and len(t) >= 5 and t.isalpha():
+        t = _split_glued_surname(t)
+    return t.title()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Region helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -90,6 +143,26 @@ def _yyyy_mm_dd(dmy: str) -> str:
         return dmy
     d, mo, y = m.groups()
     return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+     "nov", "dec"), 1)}
+
+
+def _to_iso_date(s: str) -> str:
+    """Normalise 'DD/MM/YYYY', 'DD-MM-YYYY' or 'DD-Mon-YYYY' (e.g.
+    '09-Jun-2004', '09-August-2022') to ISO 'YYYY-MM-DD'. Returns '' when
+    the string isn't a recognisable date."""
+    m = re.match(r"\s*(\d{1,2})[/\-.\s]+([A-Za-z]{3,}|\d{1,2})[/\-.\s]+"
+                 r"(\d{4})", s)
+    if not m:
+        return ""
+    d, mo, y = m.groups()
+    mon = int(mo) if mo.isdigit() else _MONTHS.get(mo[:3].lower(), 0)
+    if not (1 <= mon <= 12) or not (1 <= int(d) <= 31):
+        return ""
+    return f"{y}-{mon:02d}-{int(d):02d}"
 
 
 def _yymmdd_to_dmy(s: str) -> str:
@@ -152,10 +225,10 @@ def build_pan(regions: List[Dict], full_text: str) -> Dict[str, Any]:
                 break
         # names is bottom→top; bottom one (closest to DOB) is father, top one is full
         if len(names) >= 1:
-            father_name = names[0]["text"].title()
+            father_name = _clean_name(names[0]["text"])
             par_conf = names[0]["conf"]
         if len(names) >= 2:
-            full_name = names[1]["text"].title()
+            full_name = _clean_name(names[1]["text"])
             fn_conf = names[1]["conf"]
 
     data = {
@@ -209,20 +282,30 @@ def _looks_like_aadhaar_name(text: str) -> bool:
     return letters >= 4 and letters / len(t) > 0.8
 
 
-def _aadhaar_name(ordered: List[Dict], dob_raw: str) -> Tuple[str, float]:
-    """Prefer the name token directly above the DOB; otherwise fall back to
-    the first plausible name token in reading order."""
-    if dob_raw:
-        dob_idx = next((i for i, r in enumerate(ordered)
-                        if dob_raw in r["text"]), -1)
-        if dob_idx > 0:
-            for j in range(dob_idx - 1, -1, -1):
-                if _looks_like_aadhaar_name(ordered[j]["text"]):
-                    return (ordered[j]["text"].strip().title(),
-                            ordered[j]["conf"])
+_DOB_ANCHOR_RX = re.compile(
+    r"(?:DOB|DATE\s*OF\s*BIRTH|YEAR\s*OF\s*BIRTH|YOB)"
+    r"[:\s/]*(?:[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}|\d{4}\b)",
+    re.I,
+)
+
+
+def _aadhaar_name(ordered: List[Dict]) -> Tuple[str, float]:
+    """The cardholder name prints directly above the DOB line.
+
+    Anchor on the region that actually carries 'DOB <date>' — not the
+    boilerplate paragraph that merely mentions 'date of birth', and not a
+    stray print/issue date — then take the first name-like region above
+    it. Only if no real DOB line is found do we fall back to the first
+    plausible name in reading order."""
+    dob_idx = next((i for i, r in enumerate(ordered)
+                    if _DOB_ANCHOR_RX.search(r["text"])), -1)
+    if dob_idx > 0:
+        for j in range(dob_idx - 1, -1, -1):
+            if _looks_like_aadhaar_name(ordered[j]["text"]):
+                return _clean_name(ordered[j]["text"]), ordered[j]["conf"]
     for r in ordered:
         if _looks_like_aadhaar_name(r["text"]):
-            return r["text"].strip().title(), r["conf"]
+            return _clean_name(r["text"]), r["conf"]
     return "", 0.0
 
 
@@ -237,30 +320,91 @@ _INDIAN_STATES = (
 )
 
 
-def _aadhaar_address(ordered: List[Dict]) -> Tuple[
+_AADHAAR_ADDR_MARKERS = re.compile(
+    r"C/O|S/O|D/O|W/O|HOUSE\s*NO|\bH\.?\s*NO\b|HNO|FLAT|FLOOR|SECTOR|"
+    r"\bVTC\b|\bP\.?\s*O\b|SUB\s*DIST|DISTRICT|\bDIST\b|STATE|PIN\s*CODE|"
+    r"\bPIN\b|VILLAGE|ROAD|STREET|NAGAR|COLONY|BLOCK|LANE|MARG|TEHSIL|"
+    r"MANDAL|TALUK|GALI|CHOWK",
+    re.I,
+)
+
+
+def _is_aadhaar_addr_line(text: str) -> bool:
+    """A line carrying Aadhaar address content — identified by the
+    structured markers Aadhaar prints (C/O, House No, VTC, PO, District,
+    State, PIN Code …), a 'CITY-PIN' chunk, or a bare 6-digit PIN."""
+    t = text.strip()
+    if not t:
+        return False
+    if _AADHAAR_ADDR_MARKERS.search(t):
+        return True
+    if re.search(r"[A-Za-z]{3,}\s*-\s*\d{6}\b", t):
+        return True
+    return bool(re.fullmatch(r"\d{6}", re.sub(r"\s+", "", t)))
+
+
+def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
     """Return (address_string, conf, zip, care_of, care_of_relation, components).
 
-    The address starts at the 'Address:' / 'पता:' marker and runs to the
-    trailing 6-digit PIN. We additionally try to pick out house number,
-    city, district, state from the joined string."""
-    addr_idx = next((i for i, r in enumerate(ordered)
-                     if re.search(r"ADDRESS", r["text"], re.I)), -1)
-    if addr_idx < 0:
+    Aadhaar address extraction has to survive two awkward layouts:
+
+      * the boilerplate paragraph contains the word 'address', so the
+        printed 'Address:' label is found by being a SHORT region — not
+        any region merely mentioning the word; and
+      * a full e-card prints all four panels on one image, so the address
+        appears twice. Address-content lines are gathered by marker,
+        clustered into x-columns (one column per panel) and the richest
+        cluster wins — that drops the duplicate, lower-quality copy."""
+    # ── locate the printed 'Address:' label (a short region) ──
+    label_idx = -1
+    for i, r in enumerate(ordered):
+        t = r["text"].strip()
+        if re.search(r"\bADDRESS\b|पता", t, re.I) and len(t.split()) <= 3:
+            label_idx = i
+            break
+
+    digits_aadhaar = re.sub(r"\D", "", aadhaar_num)
+
+    def _is_id_number(t: str) -> bool:
+        """Aadhaar / VID numbers print near the address — never part of it."""
+        d = re.sub(r"\D", "", t)
+        return len(d) >= 11 or bool(digits_aadhaar and digits_aadhaar in d)
+
+    # ── candidate address regions: marker lines, plus the line right
+    #    after the label (the opening address line often has no marker) ──
+    candidates: List[Dict] = []
+    for i, r in enumerate(ordered):
+        t = r["text"].strip()
+        if not t or _is_id_number(t):
+            continue
+        if re.search(r"VID[:\s]|MOBILE|UIDAI|WWW\.|HELP@|ENROL", t, re.I):
+            continue
+        if _is_aadhaar_addr_line(t) or (label_idx >= 0 and i == label_idx + 1):
+            candidates.append(r)
+    if not candidates:
         return "", 0.0, "", "", "father", {}
 
-    parts: List[str] = []
-    confs: List[float] = []
-    for r in ordered[addr_idx + 1:]:
-        t = r["text"].strip()
-        if not t:
-            continue
-        if re.search(r"AADHAAR|UIDAI|MOBILE|HELP|WWW|VID|ENROL", t, re.I):
-            break
-        parts.append(t)
-        confs.append(r["conf"])
+    # ── cluster by x-column — a multi-panel e-card prints the address
+    #    once per panel, each panel being its own x-band ──
+    clusters: List[List[Dict]] = []
+    for r in sorted(candidates, key=lambda c: c["region"].bbox[0]):
+        x = r["region"].bbox[0]
+        if clusters and x - clusters[-1][-1]["region"].bbox[0] <= 120:
+            clusters[-1].append(r)
+        else:
+            clusters.append([r])
+    best = max(clusters, key=lambda cl: (
+        sum(_is_aadhaar_addr_line(x["text"]) for x in cl), len(cl)))
+    best.sort(key=lambda r: r["region"].bbox[1])
+
+    parts = [r["text"].strip() for r in best]
+    confs = [r["conf"] for r in best]
 
     full = ", ".join(parts).strip(" ,")
+    full = re.sub(r"(?:\s*,\s*)+", ", ", full).strip(" ,")
+    full = re.sub(r"\s+", " ", full)
+
     zipm = re.search(r"\b(\d{6})\b", full)
     pin = zipm.group(1) if zipm else ""
 
@@ -272,14 +416,14 @@ def _aadhaar_address(ordered: List[Dict]) -> Tuple[
     care_of = ""
     care_of_relation = "father"      # sensible default for empty case
     if co_match:
-        care_of = co_match.group(2).strip().title()
+        care_of = _clean_name(co_match.group(2))
         prefix = co_match.group(1).upper()
         care_of_relation = {
             "C/O": "care_of", "S/O": "father",
             "D/O": "father",  "W/O": "husband",
         }.get(prefix, "care_of")
 
-    # Address sub-components — best-effort.
+    # ── sub-components — best-effort ──
     components: Dict[str, str] = {
         "first_line": "", "second_line": "", "locality": "", "landmark": "",
         "house_number": "", "district": "", "city": "", "state": "",
@@ -293,24 +437,36 @@ def _aadhaar_address(ordered: List[Dict]) -> Tuple[
             components["state"] = state.title()
             break
 
-    # House number: first numeric token in the first address segment.
-    first_seg = parts[0] if parts else ""
-    hn = re.search(r"\b(\d{1,5}(?:/\d{1,4})?)\b", first_seg)
+    # House number: the value printed against a 'House No' label, else the
+    # leading numeric token of the first non-care-of segment ('B-1203').
+    hn = re.search(r"(?:HOUSE\s*NO|H\.?\s*NO|HNO|FLAT)[.:\s]*"
+                   r"(\d{1,5}(?:/\d{1,4})?)", full, re.I)
+    if not hn:
+        first_seg = next((p for p in parts
+                          if not re.match(r"C/O|S/O|D/O|W/O", p, re.I)), "")
+        hn = re.search(r"\b([A-Za-z]?-?\d{1,5}(?:/\d{1,4})?)\b", first_seg)
     if hn:
-        components["house_number"] = hn.group(1)
+        components["house_number"] = re.sub(r"^[A-Za-z]-?", "", hn.group(1))
 
-    # City / district heuristic: walk the comma-separated tokens, pick the
-    # last two purely-alphabetic ones that aren't the state name.
-    tokens = [t.strip() for t in full.split(",") if t.strip()]
-    alpha_tokens = [
-        t for t in tokens
-        if re.fullmatch(r"[A-Za-z][A-Za-z\s\-]*", t)
-        and t.upper() not in {components["state"].upper(), "INDIA"}
-    ]
-    if alpha_tokens:
-        components["city"] = alpha_tokens[-1].strip().title()
-    if len(alpha_tokens) >= 2:
-        components["district"] = alpha_tokens[-2].strip().title()
+    # District / city from their labelled segments where present.
+    dm = re.search(r"\bDISTRICT[.:\s]+([A-Za-z][A-Za-z\s]*?)\s*[,;]",
+                   full, re.I)
+    if dm:
+        components["district"] = _clean_name(dm.group(1))
+    vm = re.search(r"\bVTC[.:\s]*([A-Za-z][A-Za-z\s]*?)\s*[,;]", full, re.I)
+    if vm:
+        components["city"] = _clean_name(vm.group(1))
+
+    # Fallback city / district: last two purely-alphabetic comma tokens.
+    if not components["city"] or not components["district"]:
+        tokens = [t.strip() for t in full.split(",") if t.strip()]
+        alpha = [t for t in tokens
+                 if re.fullmatch(r"[A-Za-z][A-Za-z\s\-]*", t)
+                 and t.upper() not in {components["state"].upper(), "INDIA"}]
+        if not components["city"] and alpha:
+            components["city"] = alpha[-1].strip().title()
+        if not components["district"] and len(alpha) >= 2:
+            components["district"] = alpha[-2].strip().title()
 
     conf = sum(confs) / len(confs) if confs else 0.0
     return full, conf, pin, care_of, care_of_relation, components
@@ -324,8 +480,11 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     aadhaar_num = re.sub(r"\s+", "", num_match.group(1)) if num_match else ""
     a_conf = _conf_for(regions, aadhaar_num)
 
+    # Anchor on a labelled DOB so the confidence lookup lands on the real
+    # birth-date region, not a stray print/issue date elsewhere on the card.
     dob_raw_match = re.search(
-        r"(?:DOB[:\s]*)?([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text)
+        r"(?:DOB|DATE\s*OF\s*BIRTH)[:\s/]*"
+        r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
     dob_raw = dob_raw_match.group(1) if dob_raw_match else ""
     dob_val, yob_only = _aadhaar_dob(full_text)
     dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0
@@ -338,11 +497,11 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
                   "transgender": "T"}[gm.group(1).lower()]
         g_conf = _conf_for(regions, gm.group(1))
 
-    full_name, name_conf = _aadhaar_name(ordered, dob_raw)
+    full_name, name_conf = _aadhaar_name(ordered)
 
     # ── back-side signals (address) ──
     addr, addr_conf, pin, care_of, co_relation, addr_comps = \
-        _aadhaar_address(ordered)
+        _aadhaar_address(ordered, aadhaar_num)
 
     # Detect which side(s) the image actually shows. DOB / gender belong
     # to the front; address belongs to the back. uniqueness_id is only
@@ -418,9 +577,8 @@ def _split_mrz_line1(line1: str) -> Tuple[str, str, str, str]:
     else:
         tail = tail.lstrip("<")
     parts = [p for p in tail.split("<<") if p]
-    surname = (parts[0].replace("<", " ").strip().title()
-               if parts else "")
-    given = (parts[1].replace("<", " ").strip().title()
+    surname = _clean_name(parts[0].replace("<", " ")) if parts else ""
+    given = (_clean_name(parts[1].replace("<", " "))
              if len(parts) > 1 else "")
     return type_, country, surname, given
 
@@ -462,7 +620,7 @@ def _label_value_before(ordered: List[Dict], label_pattern: str
                     continue
                 if _BACK_LABEL_RX.search(t) or any(ch.isdigit() for ch in t):
                     return "", 0.0
-                return t.title(), ordered[j]["conf"]
+                return _clean_name(t), ordered[j]["conf"]
             break
     return "", 0.0
 
@@ -564,7 +722,7 @@ def _passport_back_names(ordered: List[Dict]
     picks: List[Tuple[str, float]] = []
     for r in ordered[:addr_idx]:
         if _looks_like_passport_name(r["text"]):
-            picks.append((r["text"].strip().title(), r["conf"]))
+            picks.append((_clean_name(r["text"]), r["conf"]))
         if len(picks) == 3:
             break
     while len(picks) < 3:
@@ -630,10 +788,21 @@ def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 
     # Fallback to labelled fields when the MRZ second line is malformed.
     if not dob:
-        m = re.search(r"DATE\s*OF\s*BIRTH[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
+        m = re.search(r"(?:DATE\s*OF\s*BIRTH|BIRTH)[:\s]*"
+                      r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
                       full_text, re.I)
         if m:
             dob = m.group(1)
+    if not dob:
+        # DOB is a required field — when both the MRZ and the explicit
+        # label are unreadable, fall back to the earliest date printed on
+        # the page. Date of issue / expiry always fall after the birth
+        # date, so the smallest year is the DOB.
+        dated = [(d, int(re.search(r"\d{4}", d).group()))
+                 for d in re.findall(
+                     r"\b[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}\b", full_text)]
+        if dated:
+            dob = min(dated, key=lambda x: x[1])[0]
     if not doe:
         m = re.search(r"DATE\s*OF\s*EXPIRY[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
                       full_text, re.I)
@@ -690,252 +859,67 @@ def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 # Driving License
 # ──────────────────────────────────────────────────────────────────────────────
 
-_LICENSE_LABEL_STOPPERS = re.compile(
-    r"^(OWNER|NAME|ADDRESS|SON|WIFE|DAUGHTER|FUEL|PIN|CHASSIS|ENGINE|"
-    r"DATE|REGN|EMISSION|VALID|OWNERSHIP|BHARAT|MOTOR|FORM|SERIAL|"
-    r"CARD|ISSUE|VEHICLE|MAKER|MODEL|COLOUR|BODY|SEATING|UNLADEN|"
-    r"CUBIC|MONTH|CYLIN|REGISTRATION|TRANSPORT)\b",
-    re.I,
-)
+def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
+    """Return (YYYY-MM-DD, confidence) for a Driving Licence's DOB.
 
+    DOB is a required field. A DL prints it alongside the issue and
+    validity dates — in numeric (09-06-2004) or month-name (09-Jun-2004)
+    form — so prefer a label-anchored match; failing that, the earliest
+    date on the card is the DOB (issue / validity fall after it)."""
+    # DD<sep>MM-or-Mon<sep>YYYY, tolerating numeric and named months.
+    date_rx = r"[0-3]?\d[/\-. ]+(?:[A-Za-z]{3,}|[01]?\d)[/\-. ]+\d{4}"
+    m = re.search(rf"(?:DOB|DATE\s*OF\s*BIRTH|BIRTH)[:\s]*({date_rx})",
+                  full_text, re.I)
+    if m:
+        iso = _to_iso_date(m.group(1))
+        if iso:
+            return iso, _conf_for(regions, m.group(1))
 
-def _label_value_after_license(ordered: List[Dict], label_pattern: str,
-                               look_ahead: int = 5) -> Tuple[str, float]:
-    """Find the next non-label region's text after a label match. Used
-    for owner-name extraction — the value must look like a person name
-    (letters-only, short), so address fragments and codes are rejected."""
-    rx = re.compile(label_pattern, re.I)
-    for i, r in enumerate(ordered):
-        if rx.search(r["text"]):
-            for j in range(i + 1, min(i + 1 + look_ahead, len(ordered))):
-                t = ordered[j]["text"].strip()
-                if not t or _LICENSE_LABEL_STOPPERS.match(t):
-                    continue
-                if _looks_like_owner_name(t):
-                    return t.strip(), ordered[j]["conf"]
-            break
+    # earliest date = DOB; ISO strings sort chronologically.
+    dated = []
+    for raw in re.findall(rf"\b{date_rx}\b", full_text):
+        iso = _to_iso_date(raw)
+        if iso:
+            dated.append((iso, raw))
+    if dated:
+        dated.sort()
+        iso, raw = dated[0]
+        return iso, _conf_for(regions, raw)
     return "", 0.0
 
 
-def _next_value_after_license(ordered: List[Dict], label_pattern: str,
-                              value_pattern: str,
-                              look_ahead: int = 8) -> str:
-    rx_label = re.compile(label_pattern, re.I)
-    rx_value = re.compile(value_pattern)
-    for i, r in enumerate(ordered):
-        if rx_label.search(r["text"]):
-            for j in range(i + 1, min(i + 1 + look_ahead, len(ordered))):
-                m = rx_value.search(ordered[j]["text"].strip())
-                if m:
-                    return m.group(0)
-            break
-    return ""
-
-
-_ADDRESS_MARKERS = re.compile(
-    r"H\s*NO|HOUSE\s*NO|HNO|FLAT|FLOOR|SECTOR|ROAD|STREET|VILLAGE|"
-    r"FARM|BUILDING|APARTMENT|BLOCK|LANE|COLONY|NAGAR|MOHALLA|MARG|"
-    r"GALI|HOSTEL",
-    re.I,
-)
-
-
-def _is_address_line(text: str) -> bool:
-    """Content heuristic — the 'Address' label is often missing or
-    out-of-order in column-layout OCR, so we identify address lines by
-    what they contain rather than what precedes them. Pure date strings
-    (DD-MM-YYYY / DD-Mon-YYYY) are excluded explicitly."""
-    t = text.strip()
-    if re.fullmatch(r"[0-3]?\d[-/.](?:[A-Z]+|\d{1,2})[-/.]\d{2,4}",
-                    t, re.I):
-        return False
-    if _ADDRESS_MARKERS.search(t):
-        return True
-    if re.search(r"\bPIN[:\s]*\d{3,6}", t, re.I):
-        return True
-    # 'CHANDIGARH-160C30' / 'CHANDIGARH-160030' style — city + separator
-    # + numeric-ish chunk starting with a digit (rules out 'ROYAL-ENFIELD').
-    if re.search(r"[A-Z]{4,}\s*[-,]\s*\d[\dA-Z]{2,5}", t):
-        return True
-    # A 6-digit pin code appearing alongside letters.
-    if (re.search(r"(?<!\d)\d{6}(?!\d)", t)
-            and re.search(r"[A-Z]{3,}", t, re.I)):
-        return True
-    return False
-
-
-def _fix_pin_confusables(text: str) -> str:
-    """Repair OCR confusables in 6-char PIN-like tokens (e.g. '160C30' →
-    '160030', '4OOO43' → '400043'). Only triggers on tokens that are
-    already 6 chars and made up entirely of digit-confusable characters."""
-    confusables = str.maketrans("CcOoIiLlSs", "0000111155")
-
-    def repl(m):
-        tok = m.group(0)
-        # Touch only tokens where >=4 chars are already digits, to avoid
-        # mangling real words.
-        digit_count = sum(ch.isdigit() for ch in tok)
-        if digit_count < 4:
-            return tok
-        return tok.translate(confusables)
-
-    return re.sub(r"\b[\dCcOoIiLlSs]{6}\b", repl, text)
-
-
-def _license_address(ordered: List[Dict]) -> str:
-    """Collect every line that looks like address content, then join and
-    clean it. Avoids depending on the 'Address' label since RC/DL OCR
-    often loses it."""
-    parts: List[str] = []
-    for r in ordered:
-        t = r["text"].strip()
-        if not t or not _is_address_line(t):
-            continue
-        parts.append(t)
-    if not parts:
-        return ""
-
-    full = ", ".join(parts).strip(" ,")
-    # Drop tokens that are a prefix of any later token (e.g. a bare
-    # 'CHANDIGARH' token before a 'CHANDIGARH-160030' token).
-    tokens = [p.strip() for p in full.split(",") if p.strip()]
-    keep: List[str] = []
-    for i, p in enumerate(tokens):
-        if any(j != i and tokens[j].upper().startswith(p.upper())
-               and tokens[j] != p
-               for j in range(len(tokens))):
-            continue
-        keep.append(p)
-    full = ", ".join(keep)
-
-    full = re.sub(r"(\b[A-Z]+\b)-\1\b", r"\1", full, flags=re.I)
-    full = _fix_pin_confusables(full)
-    full = re.sub(r"\s*,\s*", ", ", full)
-    full = re.sub(r"\s+", " ", full).strip()
-    return full
-
-
-def _looks_like_owner_name(text: str) -> bool:
-    """An owner-name value is short (<=40 chars), letters-only, plausible.
-    Rejects short slash-separated tokens ('S/W/D', 'C/O') that OCR keeps."""
-    t = text.strip()
-    if not t or len(t) > 40:
-        return False
-    if any(ch.isdigit() for ch in t):
-        return False
-    if _LICENSE_LABEL_STOPPERS.match(t):
-        return False
-    if "/" in t and len(t) <= 10:
-        return False
-    words = re.findall(r"[A-Za-z]{2,}", t)
-    if not words:
-        return False
-    if len(words) == 1 and len(words[0]) < 3:
-        return False
-    return True
-
-
 def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
-    """Flat license schema covering both real Driving Licences and Vehicle
-    Registration Certificates. `document_type` is the actual variant the
-    frontend should route on — 'RC' or 'DL'. Field set is fixed so the
-    JSON shape stays stable regardless of which variant we saw."""
-    ordered = _order(regions)
+    """Driving Licence response — the minimal identity contract the
+    frontend consumes: licence number + DOB.
+
+    A Vehicle Registration Certificate routed to this endpoint still
+    yields a stable, valid response — its number lands in
+    `license_number` via the fallback pattern. RC-specific fields
+    (chassis / engine / address) are deliberately not emitted here: this
+    contract is DL-shaped and must not be mixed with the RC schema."""
     up = full_text.upper()
 
-    is_rc = bool(re.search(
-        r"REGISTRATION\s*CERTIFICATE|VEHICLE\s*CLASS|CHASSIS|"
-        r"FORM\s*23A|TRANSPORT\s*DEPARTMENT|REGN\s*NO",
-        up,
-    ))
-    document_type = "RC" if is_rc else "DL"
-
-    # ── document number ──
-    # No \b boundary: DL numbers are often concatenated with their label
-    # in the OCR output, e.g. 'DLNOMH0320080022135'.
+    # Real driving licence number — e.g. 'HR41 20220002435'. No \b
+    # boundary: DL numbers are often glued to their label in the OCR
+    # output ('DLNOHR4120220002435').
     lm = re.search(r"([A-Z]{2}\d{2}\s?\d{11})", up)
-    document_number = lm.group(1) if lm else ""
-    if not document_number:
-        rcm = re.search(r"([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5})", up)
+    license_num = lm.group(1) if lm else ""
+
+    # Vehicle Registration Certificate fallback — e.g. 'CH01CY1547'.
+    if not license_num:
+        rcm = re.search(r"\b([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{3,5})\b", up)
         if rcm:
-            document_number = rcm.group(1)
+            license_num = rcm.group(1)
+    l_conf = _conf_for(regions, license_num)
 
-    # ── owner / holder name ──
-    if is_rc:
-        name, _ = _label_value_after_license(ordered, r"OWNER\s*NAME")
-    else:
-        name, _ = _label_value_after_license(ordered, r"^NAME$|^NAME[:\s]")
-    name = name.title() if name and name.isupper() else name
-
-    # ── address ──
-    address = _license_address(ordered)
-
-    # ── chassis / engine — RC only ──
-    chassis_number = ""
-    engine_number = ""
-    if is_rc:
-        chassis_number = _next_value_after_license(
-            ordered, r"CHASSIS", r"[A-Z0-9]{10,20}")
-        engine_number = _next_value_after_license(
-            ordered, r"ENGINE", r"[A-Z0-9]{8,20}")
-
-    # ── dates ──
-    # Accept both DD-MM-YYYY and DD-MON-YYYY (e.g. '09-AUG-2022').
-    date_rx = r"[0-3]?\d[-/.](?:[A-Za-z]{3,}|\d{1,2})[-/.]\d{2,4}"
-    issue_date = ""
-    expiry_date = ""
-    if is_rc:
-        # On the RC card the labels are printed as a row and the values as
-        # another row, so naive label→next-line fails. The first two
-        # unique dates in reading order are 'Date of Regn' and
-        # 'Regn. Validity'.
-        dates = re.findall(rf"\b({date_rx})\b", full_text)
-        unique = list(dict.fromkeys(dates))
-        if unique:
-            issue_date = unique[0]
-        if len(unique) >= 2:
-            expiry_date = unique[1]
-    else:
-        doi = re.search(rf"(?:DOI|DATE\s*OF\s*ISSUE)[:\s]*({date_rx})",
-                        full_text, re.I)
-        if doi:
-            issue_date = doi.group(1)
-        val = re.search(
-            rf"(?:VALID\s*TILL|VALID\s*UPTO|DATE\s*OF\s*EXPIRY|EXPIRY)[:\s]*"
-            rf"({date_rx})",
-            full_text, re.I,
-        )
-        if val:
-            expiry_date = val.group(1)
-        # When labels are missing in the OCR, fall back to year-sorting:
-        # the earliest year is the issue date, the latest is the expiry.
-        # Reading order on these cards is broken by columns, so trusting
-        # 'first date seen' for issue gives the wrong answer.
-        if not issue_date or not expiry_date:
-            dates = re.findall(rf"\b({date_rx})\b", full_text)
-            with_year, seen = [], set()
-            for d in dates:
-                if d in seen:
-                    continue
-                seen.add(d)
-                ym = re.search(r"\d{4}", d)
-                if ym:
-                    with_year.append((d, int(ym.group())))
-            with_year.sort(key=lambda x: x[1])
-            if not issue_date and with_year:
-                issue_date = with_year[0][0]
-            if not expiry_date and len(with_year) >= 2:
-                expiry_date = with_year[-1][0]
+    dob_val, dob_conf = _license_dob(full_text, regions)
 
     data = {
-        "name": name,
-        "address": address,
-        "document_number": document_number,
-        "document_type": document_type,
-        "chassis_number": chassis_number,
-        "engine_number": engine_number,
-        "issue_date": issue_date,
-        "expiry_date": expiry_date,
+        "document_type": None,
+        "license_number": _field(license_num, l_conf),
+        "dob": {"value": dob_val, "confidence": _conf(dob_conf),
+                "yob": False},
+        "image_url": None,
     }
     return _envelope(data)
 
@@ -1007,37 +991,53 @@ def _build_voter_front(regions: List[Dict], full_text: str,
         age = am.group(1)
         age_conf = _conf_for(regions, age)
 
-    # Father / Husband name carries care_of
+    # Father / Husband / Mother name → care_of. The label and value sit
+    # in the SAME OCR region ("Father'sName:SUKESHVERMA"), so the value
+    # is taken from that region's own text — matching against the joined
+    # full_text bleeds the next line's tokens (e.g. a trailing 'F' from
+    # the Gender line) into the value.
     care_of = ""
     co_conf = 0.0
-    com = re.search(
-        r"(?:FATHER|HUSBAND)(?:'?S)?\s*NAME[:\s]*"
-        r"([A-Z][A-Z\s]{2,40})",
-        full_text, re.I,
-    )
-    if com:
-        care_of = com.group(1).strip().title()
-        co_conf = _conf_for(regions, care_of.upper())
+    for r in ordered:
+        cm = re.search(
+            r"(?:FATHER|HUSBAND|MOTHER)(?:['’]?S)?\s*NAME"
+            r"\s*[:/.\-]?\s*(\S.*)",
+            r["text"], re.I,
+        )
+        if cm and cm.group(1).strip():
+            care_of = _clean_name(cm.group(1))
+            co_conf = r["conf"]
+            break
 
-    # Full name — region just above EPIC or DOB, or the first plausible
-    # name region in reading order.
+    # Full name — the holder's own 'Name:' line. The value shares the
+    # region with its label, so strip the label off; skip the father's /
+    # mother's name region so its value isn't picked up by mistake.
     full_name = ""
     name_conf = 0.0
-    anchor_idx = -1
-    for i, r in enumerate(ordered):
-        if epic and epic in r["text"].upper():
-            anchor_idx = i
+    for r in ordered:
+        t = r["text"].strip()
+        if re.search(r"FATHER|HUSBAND|MOTHER", t, re.I):
+            continue
+        nm = re.search(r"\bNAME\s*[:/.\-]?\s*(\S.*)", t, re.I)
+        if nm and nm.group(1).strip():
+            full_name = _clean_name(nm.group(1))
+            name_conf = r["conf"]
             break
-    if anchor_idx > 0:
-        for j in range(anchor_idx - 1, -1, -1):
-            if _looks_like_voter_name(ordered[j]["text"]):
-                full_name = ordered[j]["text"].strip().title()
-                name_conf = ordered[j]["conf"]
-                break
+
+    # Fallback: region just above EPIC, else first plausible name region.
+    if not full_name:
+        anchor_idx = next((i for i, r in enumerate(ordered)
+                           if epic and epic in r["text"].upper()), -1)
+        if anchor_idx > 0:
+            for j in range(anchor_idx - 1, -1, -1):
+                if _looks_like_voter_name(ordered[j]["text"]):
+                    full_name = _clean_name(ordered[j]["text"])
+                    name_conf = ordered[j]["conf"]
+                    break
     if not full_name:
         for r in ordered:
             if _looks_like_voter_name(r["text"]):
-                full_name = r["text"].strip().title()
+                full_name = _clean_name(r["text"])
                 name_conf = r["conf"]
                 break
 

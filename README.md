@@ -11,7 +11,7 @@ contract, and produces a redacted image.
 | PAN                  | `pan`                                                                       |
 | Passport             | `passport_front`, `passport_back`                                           |
 | Voter ID             | `voterid_front`, `voterid_back`                                             |
-| Driving Licence / RC | top-level `document_type` of `"DL"` or `"RC"`                              |
+| Driving Licence      | flat schema — `license_number` + `dob` (top-level `document_type` is `null`) |
 
 ---
 
@@ -383,30 +383,29 @@ regex:
 A `voterid_back` shape is emitted instead when the image only shows the
 address side.
 
-### Driving Licence / RC (Vehicle Registration Certificate)
+### Driving Licence
 
-The same endpoint handles both — `document_type` is the variant the
-frontend should route on. RC and DL share a flat schema (no
-`{value, confidence}` blocks, no `ocr_fields` array):
+The `/api/v1/ocr/driving-license` endpoint returns a minimal identity
+contract — the licence number and date of birth:
 
 ```json
 {
   "data": {
-    "name": "John Doe",
-    "address": "FLAT 100, SAMPLE BLOCK, SAMPLE AREA, SAMPLE CITY-110001",
-    "document_number": "XX01YY1234",
-    "document_type": "RC",
-    "chassis_number": "SAMPLECHASSIS1234567",
-    "engine_number":  "SAMPLEENGINE1234",
-    "issue_date":     "01-01-2023",
-    "expiry_date":    "31-12-2042"
+    "document_type": null,
+    "license_number": {"value": "HR41 20220002435", "confidence": 95},
+    "dob": {"value": "2004-06-09", "confidence": 90, "yob": false},
+    "image_url": null
   }, ...
 }
 ```
 
-For a genuine driving licence, `document_type = "DL"`,
-`document_number` is the DL number, and `chassis_number` / `engine_number`
-are empty.
+`dob` is a required field — it is taken from a labelled `DOB` line when
+present, otherwise from the earliest date on the card (issue / validity
+dates always fall after the birth date).
+
+A Vehicle Registration Certificate sent to this endpoint still returns a
+valid, DL-shaped response: its number lands in `license_number` via the
+fallback pattern.
 
 ### Failure shape
 

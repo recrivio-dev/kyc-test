@@ -458,11 +458,11 @@ curl -F "file=@sample/vote1.png" http://127.0.0.1:8000/api/v1/ocr/voter-id
 
 ---
 
-## 7. Driving License / RC OCR
+## 7. Driving License OCR
 
 **Endpoint:** `POST /api/v1/ocr/driving-license`
 
-Auto-detects between a Driving Licence (`DL`) and a Vehicle Registration Certificate (`RC`). The response schema is flat — `chassis_number` and `engine_number` are populated only for RC documents.
+Returns a minimal identity contract — the licence number and date of birth. A Vehicle Registration Certificate sent to this endpoint still returns a valid, DL-shaped response (its number lands in `license_number`).
 
 ### Request
 ```
@@ -472,7 +472,7 @@ Content-Type: multipart/form-data
 
 | Field  | Type | Required | Description |
 |--------|------|----------|-------------|
-| `file` | File | Yes      | DL or RC image |
+| `file` | File | Yes      | Driving Licence image |
 
 ### cURL Example
 ```bash
@@ -483,14 +483,17 @@ curl -F "file=@sample/dl1.png" http://127.0.0.1:8000/api/v1/ocr/driving-license
 ```json
 {
   "data": {
-    "name": "Ravi Kumar Sharma",
-    "address": "House 12, Sector 21, Chandigarh-160021",
-    "document_number": "MH0320080022135",
-    "document_type": "DL",
-    "chassis_number": "",
-    "engine_number": "",
-    "issue_date": "09-AUG-2010",
-    "expiry_date": "08-AUG-2030"
+    "document_type": null,
+    "license_number": {
+      "value": "HR41 20220002435",
+      "confidence": 95
+    },
+    "dob": {
+      "value": "2004-06-09",
+      "confidence": 90,
+      "yob": false
+    },
+    "image_url": null
   },
   "status_code": 200,
   "message_code": "success",
@@ -499,25 +502,7 @@ curl -F "file=@sample/dl1.png" http://127.0.0.1:8000/api/v1/ocr/driving-license
 }
 ```
 
-### Expected Response — Registration Certificate (RC)
-```json
-{
-  "data": {
-    "name": "Ravi Kumar Sharma",
-    "address": "House 12, Sector 21, Chandigarh-160021",
-    "document_number": "MH02AB1234",
-    "document_type": "RC",
-    "chassis_number": "ME4KC09BBKT012345",
-    "engine_number": "KC09EBKT12345",
-    "issue_date": "12-05-2019",
-    "expiry_date": "11-05-2034"
-  },
-  "status_code": 200,
-  "message_code": "success",
-  "message": null,
-  "success": true
-}
-```
+`dob` is a required field — taken from a labelled `DOB` line when present, otherwise from the earliest date on the card.
 
 ### Error Response — `400 Bad Request`
 ```json
@@ -546,6 +531,6 @@ curl -F "file=@sample/dl1.png" http://127.0.0.1:8000/api/v1/ocr/driving-license
 
 - All field values follow `{ "value": "<string>", "confidence": <int 0-100> }` shape unless otherwise noted.
 - `confidence` is the OCR-reported region-level score, scaled to `0-100`. A value of `0` indicates the field was not extracted.
-- Dates may be in `DD/MM/YYYY` (PAN, Passport), `YYYY-MM-DD` (Aadhaar, Voter ID DOB), or `DD-MM-YYYY` / `DD-MON-YYYY` (DL/RC) format depending on document type.
+- Dates may be in `DD/MM/YYYY` (PAN, Passport) or `YYYY-MM-DD` (Aadhaar, Voter ID, Driving Licence DOB) format depending on document type.
 - `ocr_fields` is always an array — Aadhaar uploads showing both sides may return two entries (front + back).
 - CORS is enabled for all origins (`*`) — tighten in production before deploy.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -145,6 +146,18 @@ def _yyyy_mm_dd(dmy: str) -> str:
     return f"{y}-{int(mo):02d}-{int(d):02d}"
 
 
+def _age_from_dob(iso_dob: str) -> str:
+    """Compute age in whole years from an ISO 'YYYY-MM-DD' date of birth.
+    Returns '' when the input isn't a usable date."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", iso_dob or "")
+    if not m:
+        return ""
+    y, mo, d = (int(g) for g in m.groups())
+    today = date.today()
+    age = today.year - y - ((today.month, today.day) < (mo, d))
+    return str(age) if 0 <= age < 150 else ""
+
+
 _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
      "nov", "dec"), 1)}
@@ -154,8 +167,13 @@ def _to_iso_date(s: str) -> str:
     """Normalise 'DD/MM/YYYY', 'DD-MM-YYYY' or 'DD-Mon-YYYY' (e.g.
     '09-Jun-2004', '09-August-2022') to ISO 'YYYY-MM-DD'. Returns '' when
     the string isn't a recognisable date."""
-    m = re.match(r"\s*(\d{1,2})[/\-.\s]+([A-Za-z]{3,}|\d{1,2})[/\-.\s]+"
-                 r"(\d{4})", s)
+    # Numeric form: separators are required so a plain digit run (e.g. a
+    # licence number) can't be mistaken for a date.
+    m = re.match(r"\s*(\d{1,2})[/\-.\s]+(\d{1,2})[/\-.\s]+(\d{4})", s)
+    if not m:
+        # Month-name form: OCR routinely fuses day/month/year together
+        # ('09JUN2004'), so the separators are optional here.
+        m = re.match(r"\s*(\d{1,2})[/\-.\s]*([A-Za-z]{3,})[/\-.\s]*(\d{4})", s)
     if not m:
         return ""
     d, mo, y = m.groups()
@@ -885,9 +903,13 @@ def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
     DOB is a required field. A DL prints it alongside the issue and
     validity dates — in numeric (09-06-2004) or month-name (09-Jun-2004)
     form — so prefer a label-anchored match; failing that, the earliest
-    date on the card is the DOB (issue / validity fall after it)."""
-    # DD<sep>MM-or-Mon<sep>YYYY, tolerating numeric and named months.
-    date_rx = r"[0-3]?\d[/\-. ]+(?:[A-Za-z]{3,}|[01]?\d)[/\-. ]+\d{4}"
+    date on the card is the DOB, but only after issue / validity dates
+    have been excluded so the issue date can't be mistaken for the DOB."""
+    # DD<sep>MM-or-Mon<sep>YYYY. Numeric months need real separators (so a
+    # licence number can't match); month names tolerate the missing
+    # separators OCR leaves behind ('09JUN2004', '08JUN-2044').
+    date_rx = (r"(?:[0-3]?\d[/\-. ]+[01]?\d[/\-. ]+\d{4}"
+               r"|[0-3]?\d[/\-. ]*[A-Za-z]{3,}[/\-. ]*\d{4})")
     m = re.search(rf"(?:DOB|DATE\s*OF\s*BIRTH|BIRTH)[:\s]*({date_rx})",
                   full_text, re.I)
     if m:
@@ -895,12 +917,19 @@ def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
         if iso:
             return iso, _conf_for(regions, m.group(1))
 
-    # earliest date = DOB; ISO strings sort chronologically.
+    # Earliest *birth-eligible* date = DOB; ISO strings sort chronologically.
+    # A date is skipped when an issue / validity / expiry label sits just
+    # before it — those dates are not the DOB and would otherwise win when
+    # the DOB itself was missed by OCR.
+    issue_rx = re.compile(r"(?:ISSUE|VALID|EXPIR|DOI\b|TILL)", re.I)
     dated = []
-    for raw in re.findall(rf"\b{date_rx}\b", full_text):
-        iso = _to_iso_date(raw)
-        if iso:
-            dated.append((iso, raw))
+    for mm in re.finditer(date_rx, full_text):
+        iso = _to_iso_date(mm.group(0))
+        if not iso:
+            continue
+        if issue_rx.search(full_text[max(0, mm.start() - 30):mm.start()]):
+            continue
+        dated.append((iso, mm.group(0)))
     if dated:
         dated.sort()
         iso, raw = dated[0]
@@ -986,11 +1015,14 @@ def _build_voter_front(regions: List[Dict], full_text: str,
     epic = epic_m.group(1) if epic_m else ""
     epic_conf = _conf_for(regions, epic)
 
-    # DOB
+    # DOB — the label on the card reads 'Date of Birth / Age : DD-MM-YYYY',
+    # so allow non-digit filler (e.g. '/ Age :') between the label and the
+    # actual date.
     dob_val = ""
     dob_conf = 0.0
     dm = re.search(
-        r"(?:DOB|DATE\s*OF\s*BIRTH|BIRTH)[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
+        r"(?:DOB|DATE\s*OF\s*BIRTH|BIRTH)[^\d]{0,20}"
+        r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
         full_text, re.I,
     )
     if dm:
@@ -1006,13 +1038,10 @@ def _build_voter_front(regions: List[Dict], full_text: str,
                   "transgender": "T"}[gm.group(1).lower()]
         g_conf = _conf_for(regions, gm.group(1))
 
-    # Age (labelled)
-    age = ""
-    age_conf = 0.0
-    am = re.search(r"\bAGE[:\s]+(\d{1,3})\b", full_text, re.I)
-    if am:
-        age = am.group(1)
-        age_conf = _conf_for(regions, age)
+    # Age — never read off the card; compute it from the DOB so it stays
+    # current. Confidence mirrors the DOB it was derived from.
+    age = _age_from_dob(dob_val)
+    age_conf = dob_conf if age else 0.0
 
     # Father / Husband / Mother name → care_of. The label and value sit
     # in the SAME OCR region ("Father'sName:SUKESHVERMA"), so the value

@@ -954,15 +954,21 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     # with a hyphen/space separator ('MH-1220050000188'), so a `[\s-]?`
     # separator is allowed between every token group.
     lm = re.search(r"([A-Z]{2}[\s-]?\d{2}[\s-]?\d{11})", up)
-    license_num = lm.group(1) if lm else ""
+    license_raw = lm.group(1) if lm else ""
 
     # Vehicle Registration Certificate fallback — e.g. 'CH01CY1547'.
-    if not license_num:
+    if not license_raw:
         rcm = re.search(
             r"\b([A-Z]{2}[\s-]?\d{1,2}[\s-]?[A-Z]{1,2}[\s-]?\d{3,5})\b", up)
         if rcm:
-            license_num = rcm.group(1)
-    l_conf = _conf_for(regions, license_num)
+            license_raw = rcm.group(1)
+    # Confidence is looked up against the raw match (the region text still
+    # carries the separator); the response value itself is the bare token.
+    l_conf = _conf_for(regions, license_raw)
+    # The state code is routinely printed with a hyphen/space separator
+    # ('JK-1120030025206', 'MH 12 20050000188'); the response contract
+    # wants those stripped so the value is a single concatenated token.
+    license_num = re.sub(r"[^A-Z0-9]", "", license_raw)
 
     dob_val, dob_conf = _license_dob(full_text, regions)
 

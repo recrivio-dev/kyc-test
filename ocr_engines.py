@@ -101,6 +101,34 @@ class RapidOCREngine(OCREngine):
         )
         return [_poly_to_xyxy(box) for box in (result or [])]
 
+    def extract_rec_only(self, image) -> OCRResult:
+        """Recognise an already-cropped single text line — detection OFF.
+
+        The caller supplies a crop that already bounds one text line, so
+        the detector is skipped entirely (`use_det=False`). This is the
+        recovery path for lines the full detect+recognise pass dropped:
+        RapidOCR's detector sometimes hands the recogniser a clipped quad,
+        the recogniser then scores it below RapidOCR's internal
+        `text_score` gate (0.5), and the whole line is silently discarded.
+        Re-recognising the padded crop with detection off reads it cleanly
+        (a tight DOB date is a frequent victim of this).
+        """
+        result, _ = self.engine(
+            image, use_det=False, use_cls=True, use_rec=True
+        )
+        texts, confs = [], []
+        for item in (result or []):
+            # With detection off RapidOCR yields [text, score] pairs.
+            txt, score = item[0], float(item[1])
+            texts.append(txt)
+            confs.append(score)
+        return OCRResult(
+            text=" ".join(t for t in texts if t),
+            words=[],
+            avg_confidence=(sum(confs) / len(confs) if confs else None),
+            engine="rapidocr",
+        )
+
     def extract_no_cls(self, image) -> OCRResult:
         """Extract WITHOUT the angle-class model.
 

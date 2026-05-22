@@ -188,9 +188,15 @@ class DocumentPipeline:
         """Generic line backend: detection + recognition are a single fused
         ONNX pass. Re-cropping each detected line and re-OCRing it only
         fragments words and loses context, so we don't — the fused pass
-        already yields per-line box + text + confidence."""
+        already yields per-line box + text + confidence.
+
+        The fused pass does, however, silently drop any line whose
+        recognition confidence falls below RapidOCR's internal
+        `text_score` gate. `_recover_dropped_lines` adds those back; that
+        step is purely additive — every line the fused pass returned is
+        left exactly as-is."""
         res = await run_extract_async(self.primary_ocr, work)
-        return [
+        results = [
             {"region": Region(wb.bbox, "text_line", 1.0),
              "crop": self._crop(work, wb.bbox),
              "text": wb.text,
@@ -198,6 +204,61 @@ class DocumentPipeline:
              "engine": "rapidocr"}
             for wb in res.words
         ]
+        results += await asyncio.to_thread(
+            self._recover_dropped_lines, work, res.words)
+        return results
+
+    @staticmethod
+    def _box_covered(box: Tuple[int, int, int, int], words) -> bool:
+        """True when `box` is already represented by a recognised word —
+        its centre falls inside a found word box, or it overlaps one by a
+        substantial fraction of its own area. Used to keep line recovery
+        purely additive (never re-emit a line the fused pass already
+        returned)."""
+        bx1, by1, bx2, by2 = box
+        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+        barea = max(1, (bx2 - bx1) * (by2 - by1))
+        for w in words:
+            wx1, wy1, wx2, wy2 = w.bbox
+            if wx1 <= cx <= wx2 and wy1 <= cy <= wy2:
+                return True
+            ix = max(0, min(bx2, wx2) - max(bx1, wx1))
+            iy = max(0, min(by2, wy2) - max(by1, wy1))
+            if ix * iy >= 0.4 * barea:
+                return True
+        return False
+
+    def _recover_dropped_lines(self, work: np.ndarray,
+                               found_words) -> List[Dict]:
+        """Re-OCR text regions the fused pass located but discarded.
+
+        RapidOCR's detector reports a box for every text line, but the
+        fused detect+recognise pass silently drops any line whose
+        recognition confidence is below its internal `text_score` gate —
+        which happens when the detector hands the recogniser a clipped
+        quad (a tight DOB date is a frequent victim). A detection-only
+        pass still reports the box; recognising the padded crop with
+        detection OFF reads it at full confidence.
+        """
+        recovered: List[Dict] = []
+        for box in self.primary_ocr.detect(work):
+            if self._box_covered(box, found_words):
+                continue
+            crop = self._crop(work, box, pad=8)
+            if crop.size == 0:
+                continue
+            rec = self.primary_ocr.extract_rec_only(crop)
+            text = rec.text.strip()
+            conf = rec.avg_confidence or 0.0
+            # Keep only confident, non-trivial reads so a forced
+            # recognition of a stray graphic cannot inject noise.
+            if conf >= 0.5 and any(ch.isalnum() for ch in text):
+                recovered.append({
+                    "region": Region(box, "text_line", 1.0),
+                    "crop": crop, "text": text, "conf": conf,
+                    "engine": "rapidocr",
+                })
+        return recovered
 
     async def _locate_and_read(self, work: np.ndarray) -> List[Dict]:
         """Stage 1+2 then Stage 3: produce per-region text, then Surya-retry

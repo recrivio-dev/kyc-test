@@ -1,0 +1,57 @@
+services:
+  ocr:
+    image: recrivio/kyc-ocr:${IMAGE_TAG:-latest}
+    container_name: kyc-ocr
+    restart: unless-stopped
+
+    # Bind ONLY to localhost — nginx on the host terminates TLS and proxies in.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # Surya / torch are installed but the fallback is gated off at boot.
+      # Flip to "true" only after pinning surya-ocr / transformers versions
+      # AND dropping WEB_CONCURRENCY to 1 (Surya ~+2 GB resident per worker).
+      KYC_ENABLE_SURYA: "false"
+      WEB_CONCURRENCY: "2"
+      GUNICORN_TIMEOUT: "120"
+      GUNICORN_LOG_LEVEL: "info"
+
+    volumes:
+      # Persist Surya/HF model downloads so we don't re-pull ~1.34 GB on
+      # every restart. Cheap insurance even with Surya off today.
+      - hf_cache:/cache/huggingface
+      - torch_cache:/cache/torch
+      # Masked output images (optional — comment out if you don't need them
+      # on disk; the API doesn't serve them).
+      - ./sample-docs:/app/sample-docs
+
+    # Resource ceilings on a 4 GB host. Container hard-stops at 3 GB so the
+    # OS + nginx + Docker daemon always have breathing room.
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+          cpus: "2.0"
+        reservations:
+          memory: 1g
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; \
+              r=urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3); \
+              sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  hf_cache:
+  torch_cache:

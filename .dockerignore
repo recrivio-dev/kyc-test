@@ -1,0 +1,36 @@
+# Keep the build context tiny — faster `docker build` + smaller image.
+.git
+.gitignore
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.bak
+*.log
+
+# Local dev only.
+venv
+.venv
+env
+
+# Heavyweight assets that don't belong in the image.
+sample
+sample-docs
+models
+
+# Streamlit + CLI not used in the API container.
+app.py
+main.py
+test_ocr.py
+postman.md
+README.md
+
+# Backup file.
+output_schema.py.bak
+
+# Deploy assets aren't needed inside the container.
+deploy
+docker-compose.yml
+.env
+.env.example

@@ -47,10 +47,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Runtime system libs only.
 # - libgomp1: required by onnxruntime + torch (OpenMP).
-# - libglib2.0-0: opencv-python-headless transitive dep on some bases.
+# - libglib2.0-0, libxcb1: opencv-python-headless transitive deps on slim.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         libglib2.0-0 \
+        libxcb1 \
         tini \
     && rm -rf /var/lib/apt/lists/*
 

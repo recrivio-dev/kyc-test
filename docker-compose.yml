@@ -1,6 +1,6 @@
 services:
   ocr:
-    image: recrivio/kyc-ocr:${IMAGE_TAG:-latest}
+    image: recriviodev/kyc-ocr:${IMAGE_TAG:-latest}
     container_name: kyc-ocr
     restart: unless-stopped
 

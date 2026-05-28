@@ -518,8 +518,11 @@ class DocumentPipeline:
             return result
 
         # ── Stage 4: direct masking ──
+        # Force a raster extension: the masked output is always an image, but
+        # the input may be a PDF/webp whose extension cv2.imwrite can't encode.
+        stem = os.path.splitext(os.path.basename(path))[0]
         out_path = os.path.join(
-            self.settings.output_dir, f"masked_{os.path.basename(path)}")
+            self.settings.output_dir, f"masked_{stem}.png")
         masked = self.create_masked_image(
             work, region_results, extracted, actual, out_path)
 

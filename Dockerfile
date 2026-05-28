@@ -47,11 +47,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Runtime system libs only.
 # - libgomp1: required by onnxruntime + torch (OpenMP).
-# - libglib2.0-0, libxcb1: opencv-python-headless transitive deps on slim.
+# - libglib2.0-0, libxcb1, libgl1: opencv transitive deps on slim. libgl1 is
+#   needed because torchvision/surya pull in cv2 paths that still link
+#   against libGL even when opencv-python-headless is the installed wheel.
+# - libsm6, libxext6, libxrender1: extra cv2 transitive deps that surface
+#   when surya/torchvision touch the imaging stack.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         libglib2.0-0 \
         libxcb1 \
+        libgl1 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
         tini \
     && rm -rf /var/lib/apt/lists/*
 

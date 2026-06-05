@@ -11,7 +11,7 @@ contract, and produces a redacted image.
 | PAN                  | `pan`                                                                       |
 | Passport             | `passport_front`, `passport_back`                                           |
 | Voter ID             | `voterid_front`, `voterid_back`                                             |
-| Driving Licence      | flat schema — `license_number` + `dob` (top-level `document_type` is `null`) |
+| Driving Licence      | flat schema — `license_number`, `name`, `swd`, `dob`, `blood_group`, `address`, `issue_date` (top-level `document_type` is `null`) |
 
 ---
 
@@ -385,27 +385,37 @@ address side.
 
 ### Driving Licence
 
-The `/api/v1/ocr/driving-license` endpoint returns a minimal identity
-contract — the licence number and date of birth:
+The `/api/v1/ocr/driving-license` endpoint returns the licence number
+plus the holder's printed card fields — name, S/W/D (guardian), DOB,
+blood group, address and issue date:
 
 ```json
 {
   "data": {
     "document_type": null,
-    "license_number": {"value": "HR41 20220002435", "confidence": 95},
-    "dob": {"value": "2004-06-09", "confidence": 90, "yob": false},
+    "license_number": {"value": "HR4120220002435", "confidence": 98},
+    "name": {"value": "Jay Verma", "confidence": 97},
+    "swd": {"value": "Sukesh Verma", "confidence": 96},
+    "dob": {"value": "2004-06-09", "confidence": 92, "yob": false},
+    "blood_group": {"value": "B+", "confidence": 98},
+    "address": {"value": "150 KHADAK SINGH FARM, KURUKSHETRA ROAD, PEHOWA, KURUKSHETRA, HR 136128", "confidence": 93},
+    "issue_date": {"value": "2022-08-09", "confidence": 96},
     "image_url": null
   }, ...
 }
 ```
 
-`dob` is a required field — it is taken from a labelled `DOB` line when
-present, otherwise from the earliest date on the card (issue / validity
-dates always fall after the birth date).
+The card fields are resolved by anchoring each printed label to its
+value — handling both the separate-region layout (`NAME` → `JAY VERMA`)
+and the glued layout some states print (`DOB:12-05-1986`). `dob` is a
+required field — taken from a labelled `DOB` line when present, otherwise
+from the earliest date on the card (issue / validity dates always fall
+after the birth date). Any field OCR can't recover confidently comes back
+as an empty value with confidence `0`, so the JSON shape stays stable.
 
 A Vehicle Registration Certificate sent to this endpoint still returns a
 valid, DL-shaped response: its number lands in `license_number` via the
-fallback pattern.
+fallback pattern, and the DL-only fields come back empty.
 
 ### Failure shape
 

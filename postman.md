@@ -1,6 +1,6 @@
 # Recrivio KYC OCR — API Reference
 
-Base URL: `http://127.0.0.1:8000`.
+Base URL: `http://127.0.0.1:8000`. 
 
 All OCR endpoints accept `multipart/form-data` with an image file (`.jpg`, `.png`, `.jpeg`). The response envelope is consistent across endpoints:
 

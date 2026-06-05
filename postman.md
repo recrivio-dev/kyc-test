@@ -462,7 +462,7 @@ curl -F "file=@sample/vote1.png" http://127.0.0.1:8000/api/v1/ocr/voter-id
 
 **Endpoint:** `POST /api/v1/ocr/driving-license`
 
-Returns a minimal identity contract — the licence number and date of birth. A Vehicle Registration Certificate sent to this endpoint still returns a valid, DL-shaped response (its number lands in `license_number`).
+Returns the licence number plus the holder's printed card fields — `name`, `swd` (Son/Wife/Daughter-of), `dob`, `blood_group`, `address` and `issue_date`. A Vehicle Registration Certificate sent to this endpoint still returns a valid, DL-shaped response (its number lands in `license_number`; the DL-only fields come back empty).
 
 ### Request
 ```
@@ -485,13 +485,33 @@ curl -F "file=@sample/dl1.png" http://127.0.0.1:8000/api/v1/ocr/driving-license
   "data": {
     "document_type": null,
     "license_number": {
-      "value": "HR41 20220002435",
-      "confidence": 95
+      "value": "HR4120220002435",
+      "confidence": 98
+    },
+    "name": {
+      "value": "Jay Verma",
+      "confidence": 97
+    },
+    "swd": {
+      "value": "Sukesh Verma",
+      "confidence": 96
     },
     "dob": {
       "value": "2004-06-09",
-      "confidence": 90,
+      "confidence": 92,
       "yob": false
+    },
+    "blood_group": {
+      "value": "B+",
+      "confidence": 98
+    },
+    "address": {
+      "value": "150 KHADAK SINGH FARM, KURUKSHETRA ROAD, PEHOWA, KURUKSHETRA, HR 136128",
+      "confidence": 93
+    },
+    "issue_date": {
+      "value": "2022-08-09",
+      "confidence": 96
     },
     "image_url": null
   },

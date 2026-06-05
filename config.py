@@ -5,7 +5,15 @@ explicit and lets the Streamlit layer or tests override them per run.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -17,8 +25,11 @@ class OCRSettings:
     min_text_len: int = 2
     # Surya fallback is OFF by default: surya-ocr 0.17 needs a matching
     # `transformers` version and otherwise fails at inference. Flip this on
-    # once the dependency versions are aligned.
-    enable_surya_fallback: bool = False
+    # once the dependency versions are aligned. Overridable in production via
+    # the KYC_ENABLE_SURYA env var so the container doesn't need rebuilding.
+    enable_surya_fallback: bool = field(
+        default_factory=lambda: _env_bool("KYC_ENABLE_SURYA", False)
+    )
 
 
 @dataclass

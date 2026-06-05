@@ -73,18 +73,29 @@ _COMMON_SURNAMES = sorted((
     "NANDA", "TANEJA", "NAGPAL", "RANA", "MEHRA", "KAUR", "GILL", "BRAR",
     "SOOD", "SETH", "DAS", "SEN", "ROY", "RAO", "BHAT", "BHATT", "KUMAR",
     "SINGH", "NATH",
+    # Maharashtra / Marathi surnames — frequent on the sample licences and
+    # otherwise absent from the list, so glued tokens like 'MPALANDE' or
+    # 'NIVRUTTIBODAKE' never recover their first/last split.
+    "DESHPANDE", "DESHMUKH", "KULKARNI", "BHOSALE", "SALUNKE", "PALANDE",
+    "KARANDE", "GAIKWAD", "JADHAV", "SHINDE", "CHAVAN", "SAWANT", "BODAKE",
+    "THORAT", "NIKAM", "SHELAR", "KSHIRSAGAR", "WAGHMARE", "PAWAR", "PATIL",
+    "KADAM", "SHIRKE", "BHOSLE", "MANE", "MORE",
 ), key=len, reverse=True)
 
 
 def _split_glued_surname(token: str) -> str:
     """Split an all-caps glued name on a trailing known surname.
 
-    'RAHULGUPTA' → 'RAHUL GUPTA'. Only fires when the remaining prefix is
-    a plausible given name (≥2 chars); a token that *is* exactly a
-    surname is left untouched."""
+    'RAHULGUPTA' → 'RAHUL GUPTA', 'MPALANDE' → 'M PALANDE'. Fires when the
+    remaining prefix is a plausible given name (≥2 chars) or a single
+    initial sitting before a clearly-surname-length suffix (≥5 chars); a
+    token that *is* exactly a surname is left untouched."""
     up = token.upper()
     for sn in _COMMON_SURNAMES:
-        if up.endswith(sn) and len(up) - len(sn) >= 2:
+        if not up.endswith(sn):
+            continue
+        prefix = len(up) - len(sn)
+        if prefix >= 2 or (prefix == 1 and len(sn) >= 5):
             return f"{token[:-len(sn)]} {token[-len(sn):]}"
     return token
 
@@ -92,19 +103,24 @@ def _split_glued_surname(token: str) -> str:
 def _clean_name(text: str) -> str:
     """Normalise a person-name string.
 
-    OCR mangles the spacing between a first and last name three ways:
+    OCR mangles the spacing between a first and last name several ways:
       * it splits them across text lines      → 'JAY\\nVERMA'
       * it glues them keeping the case change → 'JayVerma'
       * it glues them in all-caps             → 'RAHULGUPTA'
+      * it drops the space after a middle initial → 'POOJA MPALANDE'
     Whitespace runs collapse to one space; a lowercase→uppercase boundary
     becomes a space (a genuine intra-word capital is vanishingly rare in
-    Indian names); an all-caps glued token is split on a trailing known
-    surname since it offers no other boundary."""
+    Indian names); every all-caps token is then split on a trailing known
+    surname — applied per token so a glued surname is recovered even when
+    the rest of the name is already spaced."""
     t = re.sub(r"\s+", " ", (text or "").strip())
     t = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
-    if " " not in t and len(t) >= 5 and t.isalpha():
-        t = _split_glued_surname(t)
-    return t.title()
+    parts = []
+    for tok in t.split(" "):
+        if len(tok) >= 5 and tok.isalpha():
+            tok = _split_glued_surname(tok)
+        parts.append(tok)
+    return " ".join(parts).title()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -937,15 +953,328 @@ def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
     return "", 0.0
 
 
+# Regions whose text marks the *end* of the address block — anything from
+# the signature / authority / class panels onward is not part of the
+# printed address and must terminate the line-gathering walk.
+_DL_ADDR_STOP = re.compile(
+    r"SIGNATURE|ISSUING|ISSUE|AADHAAR|AUTH|HOLDER|VALID|THUMB|IMPRESSION|"
+    r"DATE\s*OF|BADGE|\bBG\b|BLOOD|\bDOB\b|FORM|RULE|\bCOV\b|\bLMV\b|"
+    r"\bMCWG\b|DRIVE|UNION|STATE\s*MOTOR",
+    re.I,
+)
+
+
+def _clean_swd(value: str) -> str:
+    """Normalise the Son/Wife/Daughter-of name.
+
+    The S/W/D label is routinely glued to its value in the OCR output
+    ('S/DWOfMILINDPALANDE', 'S/DW OfRANGNATH'); `_dl_pair` strips the
+    leading 'S/D' token but a relation remnant ('W Of', 'MW Of', 'Of')
+    can survive. Only a trailing 'Of' anchors the strip, so a genuine
+    name that merely starts with D/W/M (e.g. 'WILLIAM') is left intact."""
+    t = value.strip(" :./")
+    t = re.sub(r"^(?:[DWM]\s*)*O[Ff](?=[A-Z]|\s|$)\s*", "", t)
+    return _clean_name(t)
+
+
+# Right-column regions that are never an identity *value* — labels and
+# boilerplate that must not be mistaken for a name / address under skew.
+_DL_VALUE_NOISE = re.compile(
+    r"DLNUMBER|\bDL\s*NO|INV|CARR|VALIDITY|\bVALID\b|FORM|RULE|AUTHORIS|"
+    r"AADHAAR|ISSUING|AUTHORITY|HOLDER|SIGNATURE|\bAUTH\b|DRIVE|\bCOV\b|"
+    r"\bLMV\b|\bMCWG\b|UNION|STATE\s*MOTOR|BLOOD|\bDOB\b|\bBG\b|\bNAME\b|"
+    r"DATE\s*OF|ISSUE|THUMB|IMPRESSION|BADGE",
+    re.I,
+)
+
+
+def _dl_is_name_value(t: str) -> bool:
+    """Accept a holder / guardian name value: letters-only, no digits, not
+    a blood-group token, and not a printed label / boilerplate phrase.
+    Rejects a date ('09-Jun-2004'), 'B+', or 'Inv Carr No.' that a skewed
+    value column might otherwise place on the name row."""
+    t = t.strip()
+    if any(ch.isdigit() for ch in t):
+        return False
+    if re.fullmatch(r"(?:AB|A|B|O)\s*[+\-]?\s*(?:VE)?", t, re.I):
+        return False
+    if _DL_VALUE_NOISE.search(t):
+        return False
+    return len(re.sub(r"[^A-Za-z]", "", t)) >= 3
+
+
+def _dl_is_blood_value(t: str) -> bool:
+    """Accept a blood-group value: 'B+', 'AB-', 'O+ve', or 'Not'/'Nil'."""
+    t = t.strip()
+    return bool(re.match(r"(?:AB|A|B|O)\s*[+\-]", t, re.I)
+                or re.match(r"NOT|NIL", t, re.I))
+
+
+def _dl_is_addr_value(t: str) -> bool:
+    """Accept an address line: not a label / signature marker, not a bare
+    date / number row, not a stray blood-group token. ('Issue Date',
+    '09-Aug-2022' and 'B+' are all rejected.)"""
+    t = t.strip()
+    if not t or _DL_ADDR_STOP.search(t):
+        return False
+    if re.fullmatch(r"[\d/\-.\s]+", t) or _to_iso_date(t):
+        return False
+    if _dl_is_blood_value(t):
+        return False
+    # a real address line carries a meaningful run of letters or a clear
+    # house/door number — reject a lone glyph the skewed column nudged in.
+    return len(re.sub(r"[^A-Za-z]", "", t)) >= 4 or bool(re.search(r"\d{3}", t))
+
+
+def _dl_pair(regions: List[Dict], label_rx: str, value_clean=None,
+             accept=None) -> Tuple[str, float, Optional[Dict]]:
+    """Resolve a DL 'label → value' pair, returning (value, conf, region).
+
+    A driving licence prints each label in a left column with its value
+    either glued onto the same OCR region ('DOB:12-05-1986',
+    'S/DWOfMILIND', 'Issue Date 09-Aug-2022') or sitting in a separate
+    region to its right on the same row ('NAME' → 'JAY VERMA',
+    'Blood Grp' → 'B+'). Both layouts are handled.
+
+    When the value sits in its own region we choose the region whose
+    vertical centre is *closest* to the label's — not the leftmost on a
+    band — because a photographed card is rarely perfectly deskewed and a
+    tall band would otherwise grab the row below. An optional `accept`
+    predicate filters out values of the wrong type (a date / blood group
+    landing on the name row), which makes the pairing robust to skew.
+    `region` is the region carrying the value (the label region when
+    glued) so callers can anchor further walks."""
+    rx = re.compile(label_rx, re.I)
+    label = None
+    for r in regions:
+        m = rx.search(r["text"])
+        if not m:
+            continue
+        label = r
+        tail = r["text"][m.end():].strip(" \t:.-/")
+        if tail and any(ch.isalnum() for ch in tail):
+            return (value_clean(tail) if value_clean else tail), r["conf"], r
+        break
+    if label is None:
+        return "", 0.0, None
+
+    lb = label["region"].bbox
+    lcx = (lb[0] + lb[2]) / 2.0
+    lcy = (lb[1] + lb[3]) / 2.0
+    lh = max(lb[3] - lb[1], 1)
+    band = max(lh * 1.6, 50)          # vertical tolerance, skew-friendly
+    best, best_dy = None, None
+    for o in regions:
+        if o is label:
+            continue
+        ob = o["region"].bbox
+        ocx = (ob[0] + ob[2]) / 2.0
+        ocy = (ob[1] + ob[3]) / 2.0
+        if ocx <= lcx:                # value sits in the right-hand column
+            continue
+        dy = abs(ocy - lcy)
+        if dy > band:
+            continue
+        if accept is not None and not accept(o["text"].strip()):
+            continue
+        if best is None or dy < best_dy:
+            best, best_dy = o, dy
+    if best is not None:
+        v = best["text"].strip()
+        return (value_clean(v) if value_clean else v), best["conf"], best
+    return "", label["conf"], label
+
+
+def _dl_find_label(regions: List[Dict], label_rx: str) -> Optional[Dict]:
+    rx = re.compile(label_rx, re.I)
+    for r in regions:
+        if rx.search(r["text"]):
+            return r
+    return None
+
+
+def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
+    """Resolve (name, name_conf, swd, swd_conf) by ordinal column order.
+
+    On a DL the holder name is always printed *above* the Son/Wife/
+    Daughter-of name, in a value column to the right of the labels. Picking
+    each by nearest row fails on a skewed photo — the two name rows are
+    close enough that the guardian row can win the holder's label. Vertical
+    *ordering* within a column survives any rotation, so we instead take the
+    first name-like value at/below the NAME label as the holder, then the
+    next name-like value below it as the guardian. The glued single-region
+    layout some states print ('S/DWOfMILIND') is honoured first."""
+    name_lbl = _dl_find_label(regions, r"\bNAME\b")
+    swd_lbl = _dl_find_label(
+        regions, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b")
+
+    def _glued(label, cleaner, rx):
+        if label is None:
+            return "", 0.0
+        m = re.search(rx, label["text"], re.I)
+        tail = label["text"][m.end():].strip(" \t:.-/") if m else ""
+        if tail and any(c.isalnum() for c in tail):
+            return cleaner(tail), label["conf"]
+        return "", 0.0
+
+    name_v, name_c = _glued(name_lbl, _clean_name, r"\bNAME\b")
+    swd_v, swd_c = _glued(
+        swd_lbl, _clean_swd, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b")
+
+    def _cx(r):
+        b = r["region"].bbox
+        return (b[0] + b[2]) / 2.0
+
+    def _cy(r):
+        b = r["region"].bbox
+        return (b[1] + b[3]) / 2.0
+
+    ref = name_lbl or swd_lbl
+    cands: List[Dict] = []
+    if ref is not None:
+        rcx = _cx(ref)
+        cands = sorted(
+            (o for o in regions
+             if o not in (name_lbl, swd_lbl)
+             and _cx(o) > rcx
+             and _dl_is_name_value(o["text"].strip())),
+            key=_cy)
+
+    name_y = None
+    if not name_v and name_lbl is not None and cands:
+        # The holder name is the topmost name-like value in the column;
+        # boilerplate above it is already filtered out, so a generous
+        # row-height floor tolerates the value sitting high or low under
+        # an imperfect deskew (skew of either sign).
+        nb = name_lbl["region"].bbox
+        floor = _cy(name_lbl) - max((nb[3] - nb[1]) * 1.3, 36)
+        pick = next((o for o in cands if _cy(o) >= floor), None)
+        if pick is not None:
+            name_v, name_c = _clean_name(pick["text"].strip()), pick["conf"]
+            name_y = _cy(pick)
+
+    if not swd_v and cands:
+        # The guardian name is the next name-like value below the holder.
+        if name_y is not None:
+            base = name_y
+        elif swd_lbl is not None:
+            sb = swd_lbl["region"].bbox
+            base = _cy(swd_lbl) - max((sb[3] - sb[1]) * 1.3, 36)
+        else:
+            base = -1
+        pick = next((o for o in cands if _cy(o) > base + 6), None)
+        if pick is not None:
+            swd_v, swd_c = _clean_swd(pick["text"].strip()), pick["conf"]
+
+    return name_v, name_c, swd_v, swd_c
+
+
+def _license_address(regions: List[Dict]) -> Tuple[str, float]:
+    """Assemble the multi-line printed address.
+
+    Anchored on the 'Address'/'Add' label: the value column is taken from
+    the address-valid region nearest the label, and every address-valid
+    line in that column — from the label's row downward — is gathered in
+    reading order, stopping at the first signature / issue / class marker
+    or a large vertical gap. Working off the label's row (not a single
+    matched value) means the opening line is kept even when an imperfect
+    deskew nudges the column up relative to the label."""
+    first, conf, anchor = _dl_pair(regions, r"\bADDRESS\b|\bADD",
+                                   accept=_dl_is_addr_value)
+    label = _dl_find_label(regions, r"\bADDRESS\b|\bADD")
+    if anchor is None or label is None:
+        return (first, conf) if first else ("", 0.0)
+
+    ax = anchor["region"].bbox[0]
+    lb = label["region"].bbox
+    lh = max(lb[3] - lb[1], 1)
+
+    # Two layouts: the value sits in a separate right-hand column
+    # (HR-style — the opening line may be skew-shifted above the label, so
+    # extend the top upward) or it is glued into the label's own left
+    # column (MH-style — the name / S-W-D rows sit just above, so the block
+    # must start at the label row and the glued opening line is prepended).
+    separate = ax > lb[2] - 8
+    if separate:
+        top = lb[1] - max(lh * 1.5, 45)
+        lines, confs = [], []
+    else:
+        top = lb[1] - 5
+        lines = [first] if first else []
+        confs = [conf] if first else []
+
+    col = sorted(
+        (o for o in regions
+         if o is not label
+         and o["region"].bbox[1] >= top
+         and abs(o["region"].bbox[0] - ax) <= 90
+         and _dl_is_addr_value(o["text"])),
+        key=lambda o: o["region"].bbox[1])
+
+    prev_bottom = None
+    for o in col:
+        ob = o["region"].bbox
+        if prev_bottom is not None and ob[1] - prev_bottom > 55:
+            break                          # block ended — large vertical gap
+        txt = o["text"].strip()
+        if txt:
+            lines.append(txt)
+            confs.append(o["conf"])
+        prev_bottom = ob[3]
+
+    if not lines:
+        return (first, conf) if first else ("", 0.0)
+    address = re.sub(r"\s*,\s*", ", ", ", ".join(lines))
+    address = re.sub(r",\s*,", ",", address).strip(" ,")
+    return address, confs[0]
+
+
+# Issue-date labels, canonical first. Only the genuine 'Date Of Issue'
+# labels are accepted — the printed 'Issue Date' / 'Date Of Issue', 'DOI'
+# (and the OCR-mangled 'DO/'), and Maharashtra's 'ID' as the last-resort
+# fallback. 'DLD' is deliberately excluded: it is a renewal / re-issue
+# date, not the licence's date of issue. The colon is never required as a
+# trailing boundary — OCR fuses it onto the date ('ID:12-12-2005',
+# 'DO/:14-05-2001').
+_DL_ISSUE_LABELS = (r"ISSUE\s*DATE", r"DATE\s*OF\s*ISSUE", r"\bDOI\b",
+                    r"\bDO[I/]", r"\bID\b")
+_DL_DATE_TOKEN = r"([0-3]?\d[/\-. ]*[A-Za-z0-9]{2,}[/\-. ]*\d{4})"
+
+
+def _license_issue_date(regions: List[Dict],
+                        dob_iso: str) -> Tuple[str, float]:
+    """Return (YYYY-MM-DD, conf) for the licence's date of issue.
+
+    Tries each issue-date label in priority order, first as a value glued
+    into the label's region ('Issue Date 09-Aug-2022', 'ID:12-12-2005')
+    and then as the region to the label's right. The first candidate that
+    parses to a real date other than the DOB wins — so a class / validity
+    date, or the DOB itself, can never be mistaken for the issue date."""
+    for lbl in _DL_ISSUE_LABELS:
+        glued = re.compile(lbl + r"\s*[:\-]?\s*" + _DL_DATE_TOKEN, re.I)
+        for r in regions:
+            m = glued.search(r["text"])
+            if m:
+                iso = _to_iso_date(m.group(1))
+                if iso and iso != dob_iso:
+                    return iso, r["conf"]
+    for lbl in _DL_ISSUE_LABELS:
+        v, c, _ = _dl_pair(regions, lbl)
+        iso = _to_iso_date(re.sub(r"^[:\s]+", "", v)) if v else ""
+        if iso and iso != dob_iso:
+            return iso, c
+    return "", 0.0
+
+
 def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
-    """Driving Licence response — the minimal identity contract the
-    frontend consumes: licence number + DOB.
+    """Driving Licence response — licence number, holder identity and the
+    printed card fields the frontend consumes: name, S/W/D (guardian),
+    DOB, blood group, address and issue date.
 
     A Vehicle Registration Certificate routed to this endpoint still
     yields a stable, valid response — its number lands in
-    `license_number` via the fallback pattern. RC-specific fields
-    (chassis / engine / address) are deliberately not emitted here: this
-    contract is DL-shaped and must not be mixed with the RC schema."""
+    `license_number` via the fallback pattern, and the DL-only fields
+    simply come back empty rather than mixing in the RC schema."""
     up = full_text.upper()
 
     # Real driving licence number — e.g. 'HR41 20220002435'. No \b
@@ -972,11 +1301,29 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 
     dob_val, dob_conf = _license_dob(full_text, regions)
 
+    # ── label-anchored card fields (name / guardian / blood group / address
+    #    / issue date) — robust to both the separate-region layout (HR-style:
+    #    'NAME' → 'JAY VERMA') and the glued layout (MH-style: 'DOB:..') ──
+    name_val, name_conf, swd_val, swd_conf = _license_names(regions)
+
+    bg_val, bg_conf, _ = _dl_pair(
+        regions, r"BLOOD\s*GRP|BLOOD\s*GROUP|\bBG\b", accept=_dl_is_blood_value)
+    bg_val = re.sub(r"^[:\s.]+", "", bg_val).strip()
+
+    address_val, addr_conf = _license_address(regions)
+
+    issue_val, issue_conf = _license_issue_date(regions, dob_val)
+
     data = {
         "document_type": None,
         "license_number": _field(license_num, l_conf),
+        "name": _field(name_val, name_conf),
+        "swd": _field(swd_val, swd_conf),
         "dob": {"value": dob_val, "confidence": _conf(dob_conf),
                 "yob": False},
+        "blood_group": _field(bg_val, bg_conf),
+        "address": _field(address_val, addr_conf),
+        "issue_date": _field(issue_val, issue_conf),
         "image_url": None,
     }
     return _envelope(data)

@@ -44,6 +44,16 @@ class DocumentPipeline:
         "UNKNOWN": "Unknown",
     }
 
+    # The contract field name reported for each document's redacted ID
+    # number in the /mask-identity `masked_regions` payload.
+    ID_FIELD = {
+        "AADHAAR": "aadhaar_number",
+        "PAN": "pan_number",
+        "VOTER_ID": "epic_number",
+        "PASSPORT": "passport_num",
+        "DRIVING_LICENSE": "license_number",
+    }
+
     def __init__(self, settings: Settings = SETTINGS):
         self.settings = settings
         self.primary_ocr: RapidOCREngine | None = None
@@ -456,6 +466,152 @@ class DocumentPipeline:
                     exist_ok=True)
         cv2.imwrite(output_path, masked)
         return output_path if drawn > 0 else None
+
+    # ── Mask-identity: geometry-only redaction for the frontend ──────────────
+
+    @staticmethod
+    def _box_agg(box: Tuple[int, int, int, int], hits) -> Tuple[float, int]:
+        """Aggregate the hit regions whose centre falls inside a (possibly
+        merged) mask box: report the strongest recognition confidence and the
+        total alphanumeric char count, used to size the 'keep last 4' window
+        off the regions' own glyph width."""
+        mx1, my1, mx2, my2 = box
+        best, chars = 0.0, 0
+        for (x1, y1, x2, y2), conf, nchars in hits:
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if mx1 <= cx <= mx2 and my1 <= cy <= my2:
+                best = max(best, conf)
+                chars += nchars
+        return best, chars
+
+    def _id_mask_rects(self, region_results: List[Dict], doc_type: str,
+                       extracted_id: str, img_shape) -> List[Tuple]:
+        """Compute the exact rectangles that black out every printed
+        occurrence of the ID number, keeping only the last 4 characters
+        visible. Returns (x1, y1, x2, y2, conf, field) tuples — the same
+        geometry that gets drawn, so a frontend can replicate the mask."""
+        h, w = img_shape[:2]
+        ms = self.settings.mask
+        field_name = self.ID_FIELD.get(doc_type, "id_number")
+
+        # Which regions hold the ID — same decision as _sensitive_boxes, but
+        # we keep each region's recognition confidence and char count.
+        pattern = self.patterns[doc_type]
+        id_clean = re.sub(r"[^A-Z0-9]", "", extracted_id.upper())
+        # (bbox, conf, nchars)
+        hits: List[Tuple[Tuple[int, int, int, int], float, int]] = []
+        for rr in region_results:
+            word = re.sub(r"[^A-Z0-9]", "", rr["text"].upper())
+            if not word:
+                continue
+            is_hit = bool(re.search(pattern, rr["text"].upper()))
+            if not is_hit and id_clean:
+                is_hit = (id_clean in word
+                          or (len(word) >= 6 and word in id_clean))
+            if is_hit:
+                hits.append((rr["region"].bbox, rr["conf"], len(word)))
+
+        merged = self._merge_nearby_boxes([b for b, _, _ in hits],
+                                          gap=ms.merge_gap)
+        rects: List[Tuple] = []
+        for (x1, y1, x2, y2) in merged:
+            conf, nchars = self._box_agg((x1, y1, x2, y2), hits)
+            pad = max(4, int((y2 - y1) * ms.pad_ratio))
+            bx1 = max(0, x1 - pad); by1 = max(0, y1 - pad)
+            rx2 = min(w - 1, x2 + pad); by2 = min(h - 1, y2 + pad)
+
+            # Keep only the last 4 glyphs readable by shrinking the right edge.
+            if doc_type == "AADHAAR":
+                # Tuned ratio: the 12-digit number prints across up to three
+                # groups; keep the right ~third (last 4 digits).
+                bx2 = rx2 - int((rx2 - bx1) * ms.aadhaar_visible_ratio)
+            else:
+                # Size the reveal off the region's own glyph width rather than
+                # the regex match length. A long File No. matched by a 9-char
+                # passport pattern would otherwise leave most of it readable.
+                char_w = (x2 - x1) / max(nchars, 1)
+                bx2 = int(round(x2 - 4 * char_w))
+
+            bx2 = min(rx2, max(bx1 + 1, bx2))
+            rects.append((bx1, by1, bx2, by2, conf, field_name))
+        return rects
+
+    async def mask_identity(self, path: str, doc_type: str) -> Dict:
+        """Locate and redact a document's ID number (keep last 4), fully mask
+        Aadhaar QR codes, and return the masked image plus the masked-region
+        geometry so a frontend can re-apply the mask itself.
+
+        `doc_type` is the internal upper-case key (AADHAAR / PAN / VOTER_ID /
+        PASSPORT / DRIVING_LICENSE). Safe-by-default: when nothing can be
+        confidently masked, `masked_image` is None so the caller fails closed
+        rather than publishing a maybe-unmasked image."""
+        self._ensure_ocr()
+        out: Dict = {
+            "document_detected": False,
+            "masked_image": None,        # PNG bytes when masking succeeded
+            "masked_regions": [],
+            "message": None,
+            "status": 422,               # permanent-failure default (no retry)
+        }
+        if not self.ocr_available:
+            out.update(message="OCR backend unavailable", status=503)
+            return out
+
+        doc_type = doc_type.upper()
+        if doc_type not in self.patterns:
+            out.update(message=f"Unsupported document_type: {doc_type}",
+                       status=400)
+            return out
+
+        # Preprocess identically to process_and_verify so geometry lines up.
+        img = self.load_document_image(path)
+        cropped, _ = auto_crop_document(img)
+        desk, _ = deskew(cropped)
+        angle = await self._detect_orientation(desk)
+        work = resize_for_ocr(rotate_image(desk, angle),
+                              max_side=self.settings.work_max_side)
+
+        region_results = await self._locate_and_read(work)
+        full_text = "\n".join(rr["text"] for rr in region_results
+                              if rr["text"]).upper()
+
+        extracted = self.verify_and_extract(full_text, doc_type)
+        out["document_detected"] = extracted is not None
+
+        rects: List[Tuple] = []
+        if extracted:
+            rects.extend(
+                self._id_mask_rects(region_results, doc_type, extracted,
+                                    work.shape))
+
+        if not rects:
+            out["message"] = (
+                f"No {doc_type} identity number located"
+                if not extracted else
+                "Identity number found but could not be localized for masking")
+            return out
+
+        masked = work.copy()
+        for (x1, y1, x2, y2, _conf, _field) in rects:
+            cv2.rectangle(masked, (x1, y1), (x2, y2), (0, 0, 0), -1)
+
+        ok, buf = cv2.imencode(".png", masked)
+        if not ok:
+            out.update(message="Failed to encode masked image", status=500)
+            return out
+
+        out.update(
+            masked_image=buf.tobytes(),
+            masked_regions=[
+                {"field": field_name,
+                 "bbox": [x1, y1, x2 - x1, y2 - y1],
+                 "confidence": round(float(conf), 2)}
+                for (x1, y1, x2, y2, conf, field_name) in rects
+            ],
+            message=None,
+            status=200,
+        )
+        return out
 
     # ── Top-level entry point ────────────────────────────────────────────────
 

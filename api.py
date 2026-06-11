@@ -21,18 +21,30 @@ The response body is exactly the contract documented in
 """
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from kyc_pipeline import DocumentPipeline
-from output_schema import failure_envelope
+from output_schema import failure_envelope, success_envelope
 
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
+
+# The /mask-identity contract uses lower-case, hyphenated document types.
+# Underscores are also accepted so the OCR-style VOTER_ID / DRIVING_LICENSE
+# forms work too.
+_MASK_DOC_MAP = {
+    "aadhaar": "AADHAAR",
+    "pan": "PAN",
+    "voter-id": "VOTER_ID",
+    "passport": "PASSPORT",
+    "driving-license": "DRIVING_LICENSE",
+}
 
 app = FastAPI(title="Recrivio KYC OCR", version="1.0.0")
 
@@ -116,3 +128,58 @@ async def ocr_voter_id(file: UploadFile = File(...)):
 @app.post("/api/v1/ocr/driving-license")
 async def ocr_driving_license(file: UploadFile = File(...)):
     return await _run_pipeline(file, "DRIVING_LICENSE")
+
+
+@app.post("/mask-identity")
+async def mask_identity_endpoint(
+    file: UploadFile = File(...),
+    document_type: str = Form(...),
+    client_id: Optional[str] = Form(None),
+):
+    """Redact the document's ID number (keeping the last 4 chars) plus any
+    Aadhaar QR code, and return the masked image together with the masked
+    region geometry so a frontend can re-apply the mask client-side.
+
+    Fails closed: if no document/number can be confidently located, the
+    response carries no ``masked_image`` and a 4xx (permanent) / 5xx
+    (transient) status — the caller must never publish a maybe-unmasked
+    image."""
+    key = (document_type or "").strip().lower().replace("_", "-")
+    internal = _MASK_DOC_MAP.get(key)
+    if internal is None:
+        return JSONResponse(
+            content=failure_envelope(
+                f"Unsupported document_type: {document_type}", status=400),
+            status_code=400,
+        )
+
+    suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(await file.read())
+        result = await _pipeline.mask_identity(path, internal)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # No masked image ⇒ failure. 4xx = permanent (don't retry), 5xx = transient.
+    if result.get("masked_image") is None:
+        status = result.get("status", 422)
+        return JSONResponse(
+            content=failure_envelope(
+                result.get("message") or "identity masking failed",
+                status=status),
+            status_code=status,
+        )
+
+    data = {
+        "masked_image": base64.b64encode(result["masked_image"]).decode("ascii"),
+        "mime_type": "image/png",
+        "document_detected": result["document_detected"],
+        "masked_regions": result["masked_regions"],
+        "client_id": client_id,
+    }
+    return JSONResponse(content=success_envelope(data), status_code=200)

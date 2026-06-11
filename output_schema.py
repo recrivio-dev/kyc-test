@@ -54,6 +54,13 @@ def failure_envelope(message: str, *, status: int = 400) -> Dict[str, Any]:
                      message=message, message_code="failed")
 
 
+def success_envelope(data: Dict[str, Any], *, status: int = 200) -> Dict[str, Any]:
+    """Wrap an arbitrary payload in the standard success envelope — used by
+    endpoints (e.g. /mask-identity) whose payload isn't a per-doc OCR shape."""
+    return _envelope(data, success=True, status=status,
+                     message=None, message_code="success")
+
+
 # Common Indian surnames — used to recover the first/last-name boundary
 # in an all-caps glued OCR token ('RAHULGUPTA' → 'RAHUL GUPTA'), which
 # has neither a space nor a case change to split on. Longest entries are

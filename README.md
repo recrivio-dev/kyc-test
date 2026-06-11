@@ -153,7 +153,7 @@ No PaddlePaddle dependency, no GPU required.
 
 ```
 ocr-all-classifier/
-├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], GET /healthz)
+├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], POST /mask-identity, GET /healthz)
 ├── app.py                  Streamlit UI
 ├── main.py                 CLI entry point
 ├── kyc_pipeline.py         async DocumentPipeline (locate → read → mask)
@@ -188,6 +188,7 @@ Endpoints:
 | POST   | `/api/v1/ocr/passport`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=PASSPORT`           |
 | POST   | `/api/v1/ocr/voter-id`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=VOTER_ID`           |
 | POST   | `/api/v1/ocr/driving-license`   | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=DRIVING_LICENSE`    |
+| POST   | `/mask-identity`                | multipart form: `file` + `document_type` (`aadhaar`/`pan`/`voter-id`/`passport`/`driving-license`) + optional `client_id` | Masked image (base64) + masked-region geometry — see [Identity masking](#identity-masking) |
 
 The per-doc-type routes are convenience wrappers — the frontend can
 pick the URL based on the doc type the user selected and skip the
@@ -217,6 +218,66 @@ python main.py
 
 Prompts for a document type and a file path. Prints the raw text and
 the final status.
+
+---
+
+## Identity masking
+
+`POST /mask-identity` is a redaction-only endpoint, separate from the
+OCR contract. It does **not** return extracted fields — it returns a
+masked image plus the geometry of every region it blacked out, so a
+frontend can re-apply the same mask client-side (e.g. as overlays on
+the original image) without trusting the server to ship pixels.
+
+Request (multipart):
+
+| Field           | Required | Values                                                              |
+| --------------- | -------- | ------------------------------------------------------------------- |
+| `file`          | yes      | image (or PDF — first page)                                         |
+| `document_type` | yes      | `aadhaar` / `pan` / `voter-id` / `passport` / `driving-license`     |
+| `client_id`     | no       | echoed back in the response                                         |
+
+`document_type` targets the right ID number pattern per document.
+
+```bash
+curl -F "file=@sample/adhar-test.png" -F "document_type=aadhaar" \
+     http://127.0.0.1:8000/mask-identity | jq
+```
+
+Success response (standard `{ data: … }` envelope):
+
+```json
+{
+  "data": {
+    "masked_image": "<base64 PNG>",
+    "mime_type": "image/png",
+    "document_detected": true,
+    "masked_regions": [
+      { "field": "aadhaar_number", "bbox": [153, 234, 82, 23], "confidence": 0.97 }
+    ],
+    "client_id": "cust-42"
+  },
+  "status_code": 200, "message_code": "success", "message": null, "success": true
+}
+```
+
+`bbox` is `[x, y, w, h]` in pixels of the returned `masked_image`, and
+each rectangle is the exact region blacked out — drop the same rectangle
+on the image to reproduce the mask. The `field` is the document's ID
+field name (`aadhaar_number`, `pan_number`, `epic_number`,
+`passport_num`, `license_number`).
+
+Masking guarantees:
+
+- **Last 4 kept** — every printed occurrence of the ID number is redacted
+  except its last 4 characters (Aadhaar prints the number on both card
+  sides, so all occurrences are masked).
+- **Fail closed** — when no document/number can be confidently located,
+  the response carries **no** `masked_image` and a 4xx (permanent) /
+  5xx (transient — OCR backend down) status. A consumer must treat a
+  missing `masked_image` or `document_detected: false` as a failure and
+  never publish the original image. A too-aggressive mask is recoverable;
+  a leaked number is not.
 
 ---
 

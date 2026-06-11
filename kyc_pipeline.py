@@ -45,7 +45,7 @@ class DocumentPipeline:
     }
 
     # The contract field name reported for each document's redacted ID
-    # number in the /api/v1/ocr/masked-identity `masked_regions` payload.
+    # number in the /api/v1/ocr/mask-identity `masked_regions` payload.
     ID_FIELD = {
         "AADHAAR": "aadhaar_number",
         "PAN": "pan_number",

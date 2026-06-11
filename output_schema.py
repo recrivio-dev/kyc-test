@@ -56,7 +56,7 @@ def failure_envelope(message: str, *, status: int = 400) -> Dict[str, Any]:
 
 def success_envelope(data: Dict[str, Any], *, status: int = 200) -> Dict[str, Any]:
     """Wrap an arbitrary payload in the standard success envelope — used by
-    endpoints (e.g. /api/v1/ocr/masked-identity) whose payload isn't a per-doc OCR shape."""
+    endpoints (e.g. /api/v1/ocr/mask-identity) whose payload isn't a per-doc OCR shape."""
     return _envelope(data, success=True, status=status,
                      message=None, message_code="success")
 

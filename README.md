@@ -153,7 +153,7 @@ No PaddlePaddle dependency, no GPU required.
 
 ```
 ocr-all-classifier/
-├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], POST /api/v1/ocr/masked-identity, GET /healthz)
+├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], POST /api/v1/ocr/mask-identity, GET /healthz)
 ├── app.py                  Streamlit UI
 ├── main.py                 CLI entry point
 ├── kyc_pipeline.py         async DocumentPipeline (locate → read → mask)
@@ -188,7 +188,7 @@ Endpoints:
 | POST   | `/api/v1/ocr/passport`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=PASSPORT`           |
 | POST   | `/api/v1/ocr/voter-id`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=VOTER_ID`           |
 | POST   | `/api/v1/ocr/driving-license`   | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=DRIVING_LICENSE`    |
-| POST   | `/api/v1/ocr/masked-identity`   | multipart form: `file` + `document_type` (`aadhaar`/`pan`/`voter-id`/`passport`/`driving-license`) + optional `client_id` | Masked image (base64) + masked-region geometry — see [Identity masking](#identity-masking) |
+| POST   | `/api/v1/ocr/mask-identity`   | multipart form: `file` + `document_type` (`aadhaar`/`pan`/`voter-id`/`passport`/`driving-license`) + optional `client_id` | Masked image (base64) + masked-region geometry — see [Identity masking](#identity-masking) |
 
 The per-doc-type routes are convenience wrappers — the frontend can
 pick the URL based on the doc type the user selected and skip the
@@ -223,7 +223,7 @@ the final status.
 
 ## Identity masking
 
-`POST /api/v1/ocr/masked-identity` is a redaction-only endpoint, separate from the
+`POST /api/v1/ocr/mask-identity` is a redaction-only endpoint, separate from the
 OCR contract. It does **not** return extracted fields — it returns a
 masked image plus the geometry of every region it blacked out, so a
 frontend can re-apply the same mask client-side (e.g. as overlays on
@@ -241,7 +241,7 @@ Request (multipart):
 
 ```bash
 curl -F "file=@sample/adhar-test.png" -F "document_type=aadhaar" \
-     http://127.0.0.1:8000/api/v1/ocr/masked-identity | jq
+     http://127.0.0.1:8000/api/v1/ocr/mask-identity | jq
 ```
 
 Success response (standard `{ data: … }` envelope):

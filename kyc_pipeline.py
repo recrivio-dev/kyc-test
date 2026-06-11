@@ -45,7 +45,7 @@ class DocumentPipeline:
     }
 
     # The contract field name reported for each document's redacted ID
-    # number in the /mask-identity `masked_regions` payload.
+    # number in the /api/v1/ocr/masked-identity `masked_regions` payload.
     ID_FIELD = {
         "AADHAAR": "aadhaar_number",
         "PAN": "pan_number",
@@ -536,10 +536,87 @@ class DocumentPipeline:
             rects.append((bx1, by1, bx2, by2, conf, field_name))
         return rects
 
+    # ── Coordinate transform: work-image space ⇄ original-image space ────────
+
+    @staticmethod
+    def _rot90_affine(img: np.ndarray, angle: int):
+        """Apply rotate_image(img, angle) and return (3×3 affine, rotated).
+
+        The affine maps a point in `img` to its location in the rotated
+        output — matching cv2.rotate's 90° steps exactly — so it can be
+        composed into the full original→work transform."""
+        H, W = img.shape[:2]
+        rotated = rotate_image(img, angle)
+        a = angle % 360
+        if a == 90:        # ROTATE_90_CLOCKWISE:        (x, y) → (H-1-y, x)
+            T = np.array([[0, -1, H - 1], [1, 0, 0], [0, 0, 1]], dtype=float)
+        elif a == 180:     # ROTATE_180:                 (x, y) → (W-1-x, H-1-y)
+            T = np.array([[-1, 0, W - 1], [0, -1, H - 1], [0, 0, 1]], dtype=float)
+        elif a == 270:     # ROTATE_90_COUNTERCLOCKWISE: (x, y) → (y, W-1-x)
+            T = np.array([[0, 1, 0], [-1, 0, W - 1], [0, 0, 1]], dtype=float)
+        else:              # 0° (or generic, treated as identity for mapping)
+            T = np.eye(3, dtype=float)
+        return T, rotated
+
+    async def _preprocess_with_transform(self, img: np.ndarray):
+        """Run the same crop→deskew→orient→resize chain as process_and_verify,
+        but also accumulate the 3×3 affine that maps ORIGINAL image coords to
+        the returned `work` image coords. Inverting it projects mask boxes
+        found on `work` back onto the caller's original image."""
+        T = np.eye(3, dtype=float)
+
+        # 1. auto-crop — an axis-aligned crop, i.e. a pure translation.
+        cropped, crop_dbg = auto_crop_document(img)
+        if crop_dbg.get("cropped"):
+            cx1, cy1, _, _ = crop_dbg["bbox"]
+            Tc = np.eye(3, dtype=float); Tc[0, 2] = -cx1; Tc[1, 2] = -cy1
+            T = Tc @ T
+
+        # 2. deskew — rotation about the cropped image centre (dims preserved).
+        desk, desk_dbg = deskew(cropped)
+        if desk_dbg.get("deskewed"):
+            ch, cw = cropped.shape[:2]
+            M = cv2.getRotationMatrix2D((cw // 2, ch // 2),
+                                        desk_dbg["angle_deg"], 1.0)
+            Td = np.eye(3, dtype=float); Td[:2, :] = M
+            T = Td @ T
+
+        # 3. orientation — 0/90/180/270.
+        angle = await self._detect_orientation(desk)
+        Tr, rotated = self._rot90_affine(desk, angle)
+        T = Tr @ T
+
+        # 4. resize for OCR — uniform downscale (only if larger than max_side).
+        work = resize_for_ocr(rotated, max_side=self.settings.work_max_side)
+        rh, rw = rotated.shape[:2]
+        if max(rh, rw) > self.settings.work_max_side:
+            s = self.settings.work_max_side / float(max(rh, rw))
+            Ts = np.eye(3, dtype=float); Ts[0, 0] = s; Ts[1, 1] = s
+            T = Ts @ T
+
+        return work, T
+
+    @staticmethod
+    def _project_box(box, T_inv, orig_shape):
+        """Map an axis-aligned work-space box through T_inv and return its
+        axis-aligned bounding box in original-image coords (clamped). For a
+        rotated/deskewed page the work box maps to a tilted quad — taking its
+        bounding box over-masks slightly, which is the safe direction."""
+        h, w = orig_shape[:2]
+        x1, y1, x2, y2 = box
+        corners = np.array([[x1, y1, 1], [x2, y1, 1],
+                            [x2, y2, 1], [x1, y2, 1]], dtype=float).T
+        proj = T_inv @ corners
+        xs = proj[0] / proj[2]; ys = proj[1] / proj[2]
+        ox1 = max(0, int(np.floor(xs.min()))); oy1 = max(0, int(np.floor(ys.min())))
+        ox2 = min(w - 1, int(np.ceil(xs.max()))); oy2 = min(h - 1, int(np.ceil(ys.max())))
+        return ox1, oy1, ox2, oy2
+
     async def mask_identity(self, path: str, doc_type: str) -> Dict:
-        """Locate and redact a document's ID number (keep last 4), fully mask
-        Aadhaar QR codes, and return the masked image plus the masked-region
-        geometry so a frontend can re-apply the mask itself.
+        """Redact a document's ID number (keep last 4) and return the masked
+        image plus the masked-region geometry, both in the ORIGINAL uploaded
+        image's coordinate space — so a frontend that only has the original
+        (un-cropped, un-rotated) image can overlay the masks itself.
 
         `doc_type` is the internal upper-case key (AADHAAR / PAN / VOTER_ID /
         PASSPORT / DRIVING_LICENSE). Safe-by-default: when nothing can be
@@ -563,13 +640,10 @@ class DocumentPipeline:
                        status=400)
             return out
 
-        # Preprocess identically to process_and_verify so geometry lines up.
+        # Preprocess for OCR while tracking original→work geometry, so masks
+        # found on the processed `work` image map back onto the original.
         img = self.load_document_image(path)
-        cropped, _ = auto_crop_document(img)
-        desk, _ = deskew(cropped)
-        angle = await self._detect_orientation(desk)
-        work = resize_for_ocr(rotate_image(desk, angle),
-                              max_side=self.settings.work_max_side)
+        work, T = await self._preprocess_with_transform(img)
 
         region_results = await self._locate_and_read(work)
         full_text = "\n".join(rr["text"] for rr in region_results
@@ -578,22 +652,39 @@ class DocumentPipeline:
         extracted = self.verify_and_extract(full_text, doc_type)
         out["document_detected"] = extracted is not None
 
-        rects: List[Tuple] = []
+        work_rects: List[Tuple] = []
         if extracted:
-            rects.extend(
+            work_rects.extend(
                 self._id_mask_rects(region_results, doc_type, extracted,
                                     work.shape))
 
-        if not rects:
+        if not work_rects:
             out["message"] = (
                 f"No {doc_type} identity number located"
                 if not extracted else
                 "Identity number found but could not be localized for masking")
             return out
 
-        masked = work.copy()
-        for (x1, y1, x2, y2, _conf, _field) in rects:
-            cv2.rectangle(masked, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        # Project every mask box back onto the original image and draw there,
+        # so the returned image and regions share the caller's coordinates.
+        T_inv = np.linalg.inv(T)
+        masked = img.copy()
+        masked_regions: List[Dict] = []
+        for (x1, y1, x2, y2, conf, field_name) in work_rects:
+            ox1, oy1, ox2, oy2 = self._project_box((x1, y1, x2, y2), T_inv,
+                                                   img.shape)
+            if ox2 <= ox1 or oy2 <= oy1:
+                continue
+            cv2.rectangle(masked, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
+            masked_regions.append({
+                "field": field_name,
+                "bbox": [ox1, oy1, ox2 - ox1, oy2 - oy1],
+                "confidence": round(float(conf), 2),
+            })
+
+        if not masked_regions:
+            out["message"] = "Located ID could not be mapped to the original image"
+            return out
 
         ok, buf = cv2.imencode(".png", masked)
         if not ok:
@@ -602,12 +693,7 @@ class DocumentPipeline:
 
         out.update(
             masked_image=buf.tobytes(),
-            masked_regions=[
-                {"field": field_name,
-                 "bbox": [x1, y1, x2 - x1, y2 - y1],
-                 "confidence": round(float(conf), 2)}
-                for (x1, y1, x2, y2, conf, field_name) in rects
-            ],
+            masked_regions=masked_regions,
             message=None,
             status=200,
         )

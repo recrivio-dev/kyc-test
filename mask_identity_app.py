@@ -1,4 +1,4 @@
-"""Quick Streamlit harness for the POST /mask-identity endpoint.
+"""Quick Streamlit harness for the POST /api/v1/ocr/masked-identity endpoint.
 
 Run the API first, then this UI:
 
@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw
 DOC_TYPES = ["aadhaar", "pan", "voter-id", "passport", "driving-license"]
 
 st.set_page_config(page_title="Mask Identity Tester", layout="wide")
-st.title("🛡️  /mask-identity tester")
+st.title("🛡️  /api/v1/ocr/masked-identity tester")
 
 with st.sidebar:
     base_url = st.text_input("API base URL", "http://127.0.0.1:8000")
@@ -43,7 +43,7 @@ if uploaded is not None and st.button("Mask identity", type="primary"):
 
     try:
         resp = requests.post(
-            f"{base_url.rstrip('/')}/mask-identity",
+            f"{base_url.rstrip('/')}/api/v1/ocr/masked-identity",
             files=files, data=data, timeout=120,
         )
     except requests.RequestException as e:

@@ -35,7 +35,7 @@ from output_schema import failure_envelope, success_envelope
 
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
 
-# The /mask-identity contract uses lower-case, hyphenated document types.
+# The /api/v1/ocr/masked-identity contract uses lower-case, hyphenated document types.
 # Underscores are also accepted so the OCR-style VOTER_ID / DRIVING_LICENSE
 # forms work too.
 _MASK_DOC_MAP = {
@@ -130,7 +130,7 @@ async def ocr_driving_license(file: UploadFile = File(...)):
     return await _run_pipeline(file, "DRIVING_LICENSE")
 
 
-@app.post("/mask-identity")
+@app.post("/api/v1/ocr/masked-identity")
 async def mask_identity_endpoint(
     file: UploadFile = File(...),
     document_type: str = Form(...),

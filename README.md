@@ -153,7 +153,7 @@ No PaddlePaddle dependency, no GPU required.
 
 ```
 ocr-all-classifier/
-├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], POST /mask-identity, GET /healthz)
+├── api.py                  FastAPI service (POST /api/v1/ocr[/{doc_type}], POST /api/v1/ocr/masked-identity, GET /healthz)
 ├── app.py                  Streamlit UI
 ├── main.py                 CLI entry point
 ├── kyc_pipeline.py         async DocumentPipeline (locate → read → mask)
@@ -188,7 +188,7 @@ Endpoints:
 | POST   | `/api/v1/ocr/passport`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=PASSPORT`           |
 | POST   | `/api/v1/ocr/voter-id`          | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=VOTER_ID`           |
 | POST   | `/api/v1/ocr/driving-license`   | multipart form: `file`                                                                                 | Same shape as `/api/v1/ocr` with `doc_type=DRIVING_LICENSE`    |
-| POST   | `/mask-identity`                | multipart form: `file` + `document_type` (`aadhaar`/`pan`/`voter-id`/`passport`/`driving-license`) + optional `client_id` | Masked image (base64) + masked-region geometry — see [Identity masking](#identity-masking) |
+| POST   | `/api/v1/ocr/masked-identity`   | multipart form: `file` + `document_type` (`aadhaar`/`pan`/`voter-id`/`passport`/`driving-license`) + optional `client_id` | Masked image (base64) + masked-region geometry — see [Identity masking](#identity-masking) |
 
 The per-doc-type routes are convenience wrappers — the frontend can
 pick the URL based on the doc type the user selected and skip the
@@ -223,7 +223,7 @@ the final status.
 
 ## Identity masking
 
-`POST /mask-identity` is a redaction-only endpoint, separate from the
+`POST /api/v1/ocr/masked-identity` is a redaction-only endpoint, separate from the
 OCR contract. It does **not** return extracted fields — it returns a
 masked image plus the geometry of every region it blacked out, so a
 frontend can re-apply the same mask client-side (e.g. as overlays on
@@ -241,7 +241,7 @@ Request (multipart):
 
 ```bash
 curl -F "file=@sample/adhar-test.png" -F "document_type=aadhaar" \
-     http://127.0.0.1:8000/mask-identity | jq
+     http://127.0.0.1:8000/api/v1/ocr/masked-identity | jq
 ```
 
 Success response (standard `{ data: … }` envelope):
@@ -261,17 +261,25 @@ Success response (standard `{ data: … }` envelope):
 }
 ```
 
-`bbox` is `[x, y, w, h]` in pixels of the returned `masked_image`, and
-each rectangle is the exact region blacked out — drop the same rectangle
-on the image to reproduce the mask. The `field` is the document's ID
-field name (`aadhaar_number`, `pan_number`, `epic_number`,
-`passport_num`, `license_number`).
+`bbox` is `[x, y, w, h]` in pixels of the **original uploaded image** —
+the same coordinate space as `masked_image` (which is the original image
+with the masks already drawn, at the original size and orientation). The
+service crops/deskews/rotates internally for OCR, but projects every mask
+box back through that transform, so a frontend holding only the original
+image can drop the same rectangles on it and reproduce the mask exactly.
+The `field` is the document's ID field name (`aadhaar_number`,
+`pan_number`, `epic_number`, `passport_num`, `license_number`).
 
 Masking guarantees:
 
 - **Last 4 kept** — every printed occurrence of the ID number is redacted
   except its last 4 characters (Aadhaar prints the number on both card
   sides, so all occurrences are masked).
+- **Original coordinates** — boxes are returned in the original image's
+  space, so a skewed/rotated upload still masks correctly when the frontend
+  overlays them on its untouched copy. For a tilted page the axis-aligned
+  box is the bounding box of the rotated number strip, so it errs toward
+  over-masking. (PDFs: coordinates are relative to the rendered first page.)
 - **Fail closed** — when no document/number can be confidently located,
   the response carries **no** `masked_image` and a 4xx (permanent) /
   5xx (transient — OCR backend down) status. A consumer must treat a

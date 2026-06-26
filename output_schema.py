@@ -299,17 +299,57 @@ def build_pan(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 # Aadhaar
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Context tokens that mark a date as the card's *issue* / download / print
+# date — printed on Aadhaar's left vertical strip — so it can never be
+# mistaken for the birth date.
+_AADHAAR_ISSUE_CTX = re.compile(r"ISSUE|ISSUED|DOWNLOAD|PRINT|जारी|डाउनलोड", re.I)
+
+# A bare DD/MM/YYYY (separators required) for the fallback scan.
+_AADHAAR_DATE_RX = r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}"
+
+# Date glued to a DOB label. The day/month separator is optional because
+# OCR routinely fuses the two ('2102/2002' for 21/02/2002) and the colon
+# may be a full-width '：'.
+_AADHAAR_DOB_DATE_RX = r"(\d{1,2})[/\-.：]?(\d{1,2})[/\-.：](\d{4})"
+
+
 def _aadhaar_dob(full_text: str) -> Tuple[str, bool]:
-    """Return (YYYY-MM-DD, yob_only_flag)."""
-    m = re.search(r"DOB[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
-    if m:
-        return _yyyy_mm_dd(m.group(1)), False
-    m = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[:\s]*(\d{4})", full_text, re.I)
+    """Return (YYYY-MM-DD, yob_only_flag).
+
+    Prefers an explicit 'DOB' / 'Date of Birth' label, tolerating OCR
+    noise such as 'D0B' (zero for O) and a glued date ('2102/2002'). When
+    no label is found we fall back to a bare date — but any date sitting
+    next to an 'Issue Date' / 'Download Date' label is skipped so the
+    card's issue date is never reported as the birth date.
+    """
+    # 1) Labelled DOB (OCR-tolerant). Try every label match and accept the
+    #    first that yields a valid day/month so a garbled hit can't shadow a
+    #    good one elsewhere on the card.
+    for label in (r"D[O0]B", r"DATE\s*OF\s*BIRTH"):
+        for m in re.finditer(rf"{label}[\s:：/]*{_AADHAAR_DOB_DATE_RX}",
+                             full_text, re.I):
+            d, mo, y = m.groups()
+            if 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+                return f"{y}-{int(mo):02d}-{int(d):02d}", False
+    # 2) Year of birth.
+    m = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[\s:：]*(\d{4})", full_text, re.I)
     if m:
         return m.group(1), True
-    m = re.search(r"\b([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})\b", full_text)
-    if m:
-        return _yyyy_mm_dd(m.group(1)), False
+    # 3) Bare-date fallback. Drop any date next to an issue/download label,
+    #    then take the EARLIEST remaining date: a person's birth always
+    #    predates the card's issue/print date, so this stays correct even
+    #    when OCR drops the 'Issue Date' label entirely. ISO strings sort
+    #    chronologically, so min() over them gives the earliest.
+    candidates = []
+    for dm in re.finditer(rf"\b({_AADHAAR_DATE_RX})\b", full_text):
+        ctx = full_text[max(0, dm.start() - 25):dm.end() + 25]
+        if _AADHAAR_ISSUE_CTX.search(ctx):
+            continue
+        iso = _yyyy_mm_dd(dm.group(1))
+        if re.match(r"\d{4}-\d{2}-\d{2}", iso):
+            candidates.append(iso)
+    if candidates:
+        return min(candidates), False
     return "", False
 
 
@@ -535,8 +575,8 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     # Anchor on a labelled DOB so the confidence lookup lands on the real
     # birth-date region, not a stray print/issue date elsewhere on the card.
     dob_raw_match = re.search(
-        r"(?:DOB|DATE\s*OF\s*BIRTH)[:\s/]*"
-        r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
+        r"(?:D[O0]B|DATE\s*OF\s*BIRTH)[\s:：/]*"
+        r"(\d{1,2}[/\-.：]?\d{1,2}[/\-.：]\d{4})", full_text, re.I)
     dob_raw = dob_raw_match.group(1) if dob_raw_match else ""
     dob_val, yob_only = _aadhaar_dob(full_text)
     dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0

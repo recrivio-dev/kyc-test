@@ -305,9 +305,10 @@ def build_pan(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 _DOB_LABEL_RX = re.compile(r"[D0O][O0][B8]|DATE\s*OF\s*BIRTH", re.I)
 # An Issue / Print / Download / Update date is NEVER the date of birth. A card
 # always prints one of these alongside the DOB, so they must be ruled out
-# before any "first date wins" fallback.
+# before any fallback. Fragments + common OCR garbles ('1SSUE', 'PR1NT',
+# 'D0WNL0AD') so a mangled label is still recognised as an issue date.
 _ISSUE_DATE_RX = re.compile(
-    r"ISSUE|ISSUED|PRINT|DOWNLOAD|UPDATE|GENERAT|VALID", re.I)
+    r"[I1]SSU|PR[I1L]N|D[O0]WNL|UPDAT|UPLOAD|GENERAT|VALID|EXPIR", re.I)
 _FULL_DATE_RX = re.compile(r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}")
 
 
@@ -358,14 +359,24 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
       1b. a DOB-labelled date whose day/month separator OCR dropped
          ('D0B: 2102/2002');
       2. a DOB/YOB label followed by a bare 4-digit year (year-of-birth card);
-      3. the EARLIEST remaining plausible date — a person is always born
-         before their card is issued or printed, so even when the issue
-         label is garbled beyond recognition the birth date is still the
-         oldest date on the card.
+      3. the EARLIEST remaining plausible date, but ONLY when the card shows
+         two or more dates — a person is always born before their card is
+         issued/printed, so with both present the birth date is the oldest.
+         A LONE unlabelled date is far more likely an issue/print date than a
+         DOB (e.g. a back side shows only the print date), so we refuse to
+         guess and leave the DOB empty rather than risk emitting an issue date.
 
-    Every candidate must pass :func:`_is_plausible_dob`, so impossible dates
-    (future years, month 13, …) can never surface."""
-    dates = [(m.group(0), full_text[max(0, m.start() - 18):m.start()])
+    Each date's context is the text just before it on its OWN OCR line (labels
+    print on the same line as their date), and every candidate must pass
+    :func:`_is_plausible_dob`, so impossible dates (future years, month 13, …)
+    can never surface."""
+    def _ctx(pos: int) -> str:
+        # up to 24 chars before the date, but never across a newline — the
+        # label ('DOB', 'Issue Date', 'जन्म तिथि / DOB') sits on the date's line.
+        line_start = full_text.rfind("\n", 0, pos) + 1
+        return full_text[max(line_start, pos - 24):pos]
+
+    dates = [(m.group(0), _ctx(m.start()))
              for m in _FULL_DATE_RX.finditer(full_text)]
 
     # 1) a full date explicitly carrying a DOB-style label (not an issue label)
@@ -397,13 +408,18 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
     if ym and _is_plausible_dob(ym.group(1)):
         return ym.group(1), True, ym.group(1)
 
-    # 3) the earliest plausible non-issue date
-    plausible = [(_yyyy_mm_dd(raw), raw) for raw, ctx in dates
-                 if not _ISSUE_DATE_RX.search(ctx)
-                 and _is_plausible_dob(_yyyy_mm_dd(raw))]
-    if plausible:
-        iso, raw = min(plausible, key=lambda p: p[0])
-        return iso, False, raw
+    # 3) the earliest plausible non-issue date — but only when there are >= 2
+    #    plausible dates. A single date with no DOB label is more likely an
+    #    issue/print date than a birth date, so we refuse to guess: better an
+    #    empty DOB than the issue date wrongly emitted as one.
+    all_plausible = [(_yyyy_mm_dd(raw), raw, ctx) for raw, ctx in dates
+                     if _is_plausible_dob(_yyyy_mm_dd(raw))]
+    if len(all_plausible) >= 2:
+        non_issue = [(iso, raw) for iso, raw, ctx in all_plausible
+                     if not _ISSUE_DATE_RX.search(ctx)]
+        if non_issue:
+            iso, raw = min(non_issue, key=lambda p: p[0])
+            return iso, False, raw
     return "", False, ""
 
 

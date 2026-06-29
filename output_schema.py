@@ -299,18 +299,50 @@ def build_pan(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 # Aadhaar
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _aadhaar_dob(full_text: str) -> Tuple[str, bool]:
-    """Return (YYYY-MM-DD, yob_only_flag)."""
-    m = re.search(r"DOB[:\s]*([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
-    if m:
-        return _yyyy_mm_dd(m.group(1)), False
-    m = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[:\s]*(\d{4})", full_text, re.I)
-    if m:
-        return m.group(1), True
-    m = re.search(r"\b([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})\b", full_text)
-    if m:
-        return _yyyy_mm_dd(m.group(1)), False
-    return "", False
+# OCR routinely mangles the 'DOB' label — 'D0B', 'O0B', or even '008'
+# (zero-zero-eight, seen in the wild) — so match any D/O/0 + O/0 + B/8
+# spelling, plus the spelled-out 'Date of Birth'.
+_DOB_LABEL_RX = re.compile(r"[D0O][O0][B8]|DATE\s*OF\s*BIRTH", re.I)
+# An Issue / Print / Download / Update date is NEVER the date of birth. A card
+# always prints one of these alongside the DOB, so they must be ruled out
+# before any "first date wins" fallback.
+_ISSUE_DATE_RX = re.compile(
+    r"ISSUE|ISSUED|PRINT|DOWNLOAD|UPDATE|GENERAT|VALID", re.I)
+_FULL_DATE_RX = re.compile(r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}")
+
+
+def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
+    """Pick the date of birth from the card text.
+
+    Returns ``(value, yob_only_flag, raw_matched_date)`` — ``value`` is
+    ``YYYY-MM-DD`` (or just ``YYYY`` for a year-of-birth-only card) and
+    ``raw_matched_date`` is the un-normalised match used for the confidence
+    lookup.
+
+    The hard part is NOT reading *a* date — it's reading the *right* one.
+    Every Aadhaar prints an Issue/Print date too, and OCR frequently mangles
+    the 'DOB' label into '008' / 'D0B' / 'O0B', so both a naive "first date
+    wins" and a strict ``DOB:`` anchor land on the issue date. So we inspect
+    the characters immediately preceding each date: a date tagged with a
+    DOB-style label wins; any date tagged Issue/Print/Download/Update is
+    rejected outright; only then do we fall back to the first remaining
+    (untagged) date."""
+    dates = [(m.group(0), full_text[max(0, m.start() - 18):m.start()])
+             for m in _FULL_DATE_RX.finditer(full_text)]
+
+    # 1) a date explicitly carrying a DOB-style label (and not an issue label)
+    for raw, ctx in dates:
+        if _DOB_LABEL_RX.search(ctx) and not _ISSUE_DATE_RX.search(ctx):
+            return _yyyy_mm_dd(raw), False, raw
+    # 2) a year-of-birth-only card
+    ym = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[:\s]*(\d{4})", full_text, re.I)
+    if ym:
+        return ym.group(1), True, ym.group(1)
+    # 3) the first date that is NOT an issue / print / download date
+    for raw, ctx in dates:
+        if not _ISSUE_DATE_RX.search(ctx):
+            return _yyyy_mm_dd(raw), False, raw
+    return "", False, ""
 
 
 _AADHAAR_LABELS = re.compile(
@@ -334,8 +366,11 @@ def _looks_like_aadhaar_name(text: str) -> bool:
     return letters >= 4 and letters / len(t) > 0.8
 
 
+# Same OCR-tolerant DOB label as _DOB_LABEL_RX, but it must be immediately
+# followed by an actual date so a stray '008'-like token can't anchor on its
+# own.
 _DOB_ANCHOR_RX = re.compile(
-    r"(?:DOB|DATE\s*OF\s*BIRTH|YEAR\s*OF\s*BIRTH|YOB)"
+    r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH|YEAR\s*OF\s*BIRTH|YOB)"
     r"[:\s/]*(?:[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}|\d{4}\b)",
     re.I,
 )
@@ -376,7 +411,8 @@ _AADHAAR_ADDR_MARKERS = re.compile(
     r"C/O|S/O|D/O|W/O|HOUSE\s*NO|\bH\.?\s*NO\b|HNO|FLAT|FLOOR|SECTOR|"
     r"\bVTC\b|\bP\.?\s*O\b|SUB\s*DIST|DISTRICT|\bDIST\b|STATE|PIN\s*CODE|"
     r"\bPIN\b|VILLAGE|ROAD|STREET|NAGAR|COLONY|BLOCK|LANE|MARG|TEHSIL|"
-    r"MANDAL|TALUK|GALI|CHOWK",
+    r"MANDAL|TALUK|GALI|CHOWK|AVENUE|\bAVE\b|APART?MENT|APPARTMENT|ENCLAVE|"
+    r"PHASE|PLOT|MARKET|BAZ?AR|GANJ|PURA|BAGH|CROSS|\bEXTN?\b|TOWER|\bZONE\b",
     re.I,
 )
 
@@ -384,7 +420,7 @@ _AADHAAR_ADDR_MARKERS = re.compile(
 def _is_aadhaar_addr_line(text: str) -> bool:
     """A line carrying Aadhaar address content — identified by the
     structured markers Aadhaar prints (C/O, House No, VTC, PO, District,
-    State, PIN Code …), a 'CITY-PIN' chunk, or a bare 6-digit PIN."""
+    State, PIN Code …), a 'CITY-PIN' chunk, or a 6-digit PIN."""
     t = text.strip()
     if not t:
         return False
@@ -392,30 +428,40 @@ def _is_aadhaar_addr_line(text: str) -> bool:
         return True
     if re.search(r"[A-Za-z]{3,}\s*-\s*\d{6}\b", t):
         return True
-    return bool(re.fullmatch(r"\d{6}", re.sub(r"\s+", "", t)))
+    # A bare 6-digit PIN, alone or trailing an address line ('… BENGAL 713205').
+    return bool(re.search(r"\b\d{6}\b", t))
+
+
+# Address label, OCR-tolerant: 'ADDRESS', 'ADDRBSS', 'ADORESS' (the second
+# letter is often misread, and the tail garbles) or the Hindi पता.
+_ADDR_LABEL_RX = re.compile(r"A[D0O]{1,2}R[A-Z]*S{1,2}|पता", re.I)
+# Footer / contact lines that print right under the address but are not part
+# of it (helpline 1947, email, uidai.gov.in, VID, mobile, enrolment no.).
+_ADDR_FOOTER_RX = re.compile(
+    r"VID[:\s]|MOBILE|UIDAI|WWW\.|HELP@|@|ENROL|\b1947\b|GOV\.?\s*IN", re.I)
 
 
 def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
     """Return (address_string, conf, zip, care_of, care_of_relation, components).
 
-    Aadhaar address extraction has to survive two awkward layouts:
+    Two extraction strategies are computed and the better result wins:
 
-      * the boilerplate paragraph contains the word 'address', so the
-        printed 'Address:' label is found by being a SHORT region — not
-        any region merely mentioning the word; and
-      * a full e-card prints all four panels on one image, so the address
-        appears twice. Address-content lines are gathered by marker,
-        clustered into x-columns (one column per panel) and the richest
-        cluster wins — that drops the duplicate, lower-quality copy."""
-    # ── locate the printed 'Address:' label (a short region) ──
-    label_idx = -1
-    for i, r in enumerate(ordered):
-        t = r["text"].strip()
-        if re.search(r"\bADDRESS\b|पता", t, re.I) and len(t.split()) <= 3:
-            label_idx = i
-            break
+      1. **Label-anchored span** — find the printed 'Address:' label (even when
+         OCR mangles it to 'ADDRBSS' or glues the first line onto it) and walk
+         downward, accumulating lines until the address clearly ends (an ID
+         number, a footer line, or a 6-digit PIN). This handles the common
+         real-world back-side photo where address lines carry no structured
+         marker words.
+      2. **Marker-based clusters** — gather lines that carry structured markers
+         (C/O, House No, VTC, District, PIN …), cluster them by x-column (a
+         multi-panel e-card prints the address once per panel) and keep the
+         richest cluster, dropping the duplicate, lower-quality copies.
 
+    A garbled image can make either strategy wander, so both are scored and we
+    keep whichever captured a PIN (a complete address) and is longest — that
+    way the label path wins on a clean back photo while the marker path still
+    rescues a messy multi-panel e-card whose label landed on a bad panel."""
     digits_aadhaar = re.sub(r"\D", "", aadhaar_num)
 
     def _is_id_number(t: str) -> bool:
@@ -423,36 +469,71 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         d = re.sub(r"\D", "", t)
         return len(d) >= 11 or bool(digits_aadhaar and digits_aadhaar in d)
 
-    # ── candidate address regions: marker lines, plus the line right
-    #    after the label (the opening address line often has no marker) ──
+    results: List[Tuple] = []
+
+    # ── strategy 1: label-anchored span ──
+    label_idx = next((i for i, r in enumerate(ordered)
+                      if _ADDR_LABEL_RX.search(r["text"])), -1)
+    if label_idx >= 0:
+        parts: List[str] = []
+        confs: List[float] = []
+        # The opening line is often glued onto the label ('ADDRBSS:2B/41,…') —
+        # keep whatever follows the label on that same region.
+        first = ordered[label_idx]["text"]
+        m = _ADDR_LABEL_RX.search(first)
+        tail = re.sub(r"^[\s:.\-)）]*", "", first[m.end():]).strip()
+        if tail and not _is_id_number(tail):
+            parts.append(tail)
+            confs.append(ordered[label_idx]["conf"])
+        for r in ordered[label_idx + 1:]:
+            t = r["text"].strip()
+            if not t:
+                continue
+            if _is_id_number(t) or _ADDR_FOOTER_RX.search(t):
+                break
+            parts.append(t)
+            confs.append(r["conf"])
+            if re.search(r"\b\d{6}\b", t):     # a PIN terminates the address
+                break
+        if parts:
+            results.append(_assemble_address(parts, confs, aadhaar_num))
+
+    # ── strategy 2: marker-based clusters ──
     candidates: List[Dict] = []
-    for i, r in enumerate(ordered):
+    for r in ordered:
         t = r["text"].strip()
-        if not t or _is_id_number(t):
+        if not t or _is_id_number(t) or _ADDR_FOOTER_RX.search(t):
             continue
-        if re.search(r"VID[:\s]|MOBILE|UIDAI|WWW\.|HELP@|ENROL", t, re.I):
-            continue
-        if _is_aadhaar_addr_line(t) or (label_idx >= 0 and i == label_idx + 1):
+        if _is_aadhaar_addr_line(t):
             candidates.append(r)
-    if not candidates:
+    if candidates:
+        # cluster by x-column — a multi-panel e-card prints the address once
+        # per panel, each panel being its own x-band.
+        clusters: List[List[Dict]] = []
+        for r in sorted(candidates, key=lambda c: c["region"].bbox[0]):
+            x = r["region"].bbox[0]
+            if clusters and x - clusters[-1][-1]["region"].bbox[0] <= 120:
+                clusters[-1].append(r)
+            else:
+                clusters.append([r])
+        best = max(clusters, key=lambda cl: (
+            sum(_is_aadhaar_addr_line(x["text"]) for x in cl), len(cl)))
+        best.sort(key=lambda r: r["region"].bbox[1])
+        results.append(_assemble_address([r["text"].strip() for r in best],
+                                         [r["conf"] for r in best], aadhaar_num))
+
+    if not results:
         return "", 0.0, "", "", "father", {}
 
-    # ── cluster by x-column — a multi-panel e-card prints the address
-    #    once per panel, each panel being its own x-band ──
-    clusters: List[List[Dict]] = []
-    for r in sorted(candidates, key=lambda c: c["region"].bbox[0]):
-        x = r["region"].bbox[0]
-        if clusters and x - clusters[-1][-1]["region"].bbox[0] <= 120:
-            clusters[-1].append(r)
-        else:
-            clusters.append([r])
-    best = max(clusters, key=lambda cl: (
-        sum(_is_aadhaar_addr_line(x["text"]) for x in cl), len(cl)))
-    best.sort(key=lambda r: r["region"].bbox[1])
+    # Prefer the result that captured a PIN (index 2 of the tuple) — a strong
+    # signal of a complete address — then the longest address string.
+    return max(results, key=lambda res: (1 if res[2] else 0, len(res[0])))
 
-    parts = [r["text"].strip() for r in best]
-    confs = [r["conf"] for r in best]
 
+def _assemble_address(parts: List[str], confs: List[float],
+                      aadhaar_num: str = "") -> Tuple[
+        str, float, str, str, str, Dict[str, str]]:
+    """Join ordered address lines into the address string + sub-components."""
     full = ", ".join(parts).strip(" ,")
     full = re.sub(r"(?:\s*,\s*)+", ", ", full).strip(" ,")
     full = re.sub(r"\s+", " ", full)
@@ -532,13 +613,9 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     aadhaar_num = re.sub(r"\s+", "", num_match.group(1)) if num_match else ""
     a_conf = _conf_for(regions, aadhaar_num)
 
-    # Anchor on a labelled DOB so the confidence lookup lands on the real
-    # birth-date region, not a stray print/issue date elsewhere on the card.
-    dob_raw_match = re.search(
-        r"(?:DOB|DATE\s*OF\s*BIRTH)[:\s/]*"
-        r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})", full_text, re.I)
-    dob_raw = dob_raw_match.group(1) if dob_raw_match else ""
-    dob_val, yob_only = _aadhaar_dob(full_text)
+    # _aadhaar_dob returns the raw matched date so the confidence lookup lands
+    # on the real birth-date region, not a stray print/issue date.
+    dob_val, yob_only, dob_raw = _aadhaar_dob(full_text)
     dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0
 
     gender = ""

@@ -311,6 +311,22 @@ _ISSUE_DATE_RX = re.compile(
 _FULL_DATE_RX = re.compile(r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}")
 
 
+def _is_plausible_dob(iso: str) -> bool:
+    """True if `iso` ('YYYY-MM-DD' or bare 'YYYY') is a usable birth date:
+    real calendar values and a year between 1900 and today — a date of birth
+    is never in the future, so an OCR-mangled or stray date is rejected."""
+    m = re.match(r"(\d{4})(?:-(\d{2})-(\d{2}))?$", iso)
+    if not m:
+        return False
+    if not (1900 <= int(m.group(1)) <= date.today().year):
+        return False
+    if m.group(2) is not None:
+        mo, d = int(m.group(2)), int(m.group(3))
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            return False
+    return True
+
+
 def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
     """Pick the date of birth from the card text.
 
@@ -322,33 +338,55 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
     The hard part is NOT reading *a* date — it's reading the *right* one.
     Every Aadhaar prints an Issue/Print date too, and OCR frequently mangles
     the 'DOB' label into '008' / 'D0B' / 'O0B', so both a naive "first date
-    wins" and a strict ``DOB:`` anchor land on the issue date. So we inspect
-    the characters immediately preceding each date: a date tagged with a
-    DOB-style label wins; any date tagged Issue/Print/Download/Update is
-    rejected outright; only then do we fall back to the first remaining
-    (untagged) date."""
+    wins" and a strict ``DOB:`` anchor land on the issue date. Strategy, in
+    order of confidence:
+
+      1. a date whose preceding characters carry a DOB-style label (and not an
+         issue label);
+      2. a DOB/YOB label followed by a bare 4-digit year (year-of-birth card);
+      3. the EARLIEST remaining plausible date — a person is always born
+         before their card is issued or printed, so even when the issue
+         label is garbled beyond recognition the birth date is still the
+         oldest date on the card.
+
+    Every candidate must pass :func:`_is_plausible_dob`, so impossible dates
+    (future years, month 13, …) can never surface."""
     dates = [(m.group(0), full_text[max(0, m.start() - 18):m.start()])
              for m in _FULL_DATE_RX.finditer(full_text)]
 
-    # 1) a date explicitly carrying a DOB-style label (and not an issue label)
+    # 1) a full date explicitly carrying a DOB-style label (not an issue label)
     for raw, ctx in dates:
         if _DOB_LABEL_RX.search(ctx) and not _ISSUE_DATE_RX.search(ctx):
-            return _yyyy_mm_dd(raw), False, raw
-    # 2) a year-of-birth-only card
-    ym = re.search(r"(?:YEAR\s*OF\s*BIRTH|YOB)[:\s]*(\d{4})", full_text, re.I)
-    if ym:
+            iso = _yyyy_mm_dd(raw)
+            if _is_plausible_dob(iso):
+                return iso, False, raw
+
+    # 2) a DOB / YOB label followed by a bare year (year-of-birth-only card)
+    ym = re.search(
+        r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH|YEAR\s*OF\s*BIRTH|YOB)"
+        r"[:\s]*((?:19|20)\d{2})\b", full_text, re.I)
+    if ym and _is_plausible_dob(ym.group(1)):
         return ym.group(1), True, ym.group(1)
-    # 3) the first date that is NOT an issue / print / download date
-    for raw, ctx in dates:
-        if not _ISSUE_DATE_RX.search(ctx):
-            return _yyyy_mm_dd(raw), False, raw
+
+    # 3) the earliest plausible non-issue date
+    plausible = [(_yyyy_mm_dd(raw), raw) for raw, ctx in dates
+                 if not _ISSUE_DATE_RX.search(ctx)
+                 and _is_plausible_dob(_yyyy_mm_dd(raw))]
+    if plausible:
+        iso, raw = min(plausible, key=lambda p: p[0])
+        return iso, False, raw
     return "", False, ""
 
 
+# Boilerplate/header tokens a name region must never be. Fragments (GOVE,
+# IDENTI, AUTHORI, ADDR …) rather than whole words so OCR garbles still match
+# — e.g. 'GOVEMMENT', 'IDENTINICATION', 'ADDRBSS', 'OFINDIA' all leaked
+# through as "names" before.
 _AADHAAR_LABELS = re.compile(
-    r"DOB|YEAR|MALE|FEMALE|GOVERNMENT|INDIA|AADHAAR|UIDAI|AUTHORITY|UNIQUE|"
-    r"IDENTIFICATION|ADDRESS|MOBILE|HELP|INFORMATION|SCANNING|VERIFIED|"
-    r"ENROL|PROOF|CITIZENSHIP|DATE|BIRTH|ISSUED|MERA|XML|CODE|SCANNED",
+    r"DOB|YEAR|MALE|FEMALE|GOVE|GOVT|BHARAT|REPUBLIC|OFIND|INDIA|AADH|UIDAI|"
+    r"AUTHORI|UNIQUE|IDENTI|ADDR|MOBILE|HELP|INFORMAT|SCANN|VERIFIED|ENROL|"
+    r"PROOF|CITIZEN|DATE|BIRTH|ISSUE|PRINT|DOWNLOAD|MERA|PEHCHAN|XML|"
+    r"\bCODE\b|GOV\.",
     re.I,
 )
 
@@ -590,16 +628,11 @@ def _assemble_address(parts: List[str], confs: List[float],
     if vm:
         components["city"] = _clean_name(vm.group(1))
 
-    # Fallback city / district: last two purely-alphabetic comma tokens.
-    if not components["city"] or not components["district"]:
-        tokens = [t.strip() for t in full.split(",") if t.strip()]
-        alpha = [t for t in tokens
-                 if re.fullmatch(r"[A-Za-z][A-Za-z\s\-]*", t)
-                 and t.upper() not in {components["state"].upper(), "INDIA"}]
-        if not components["city"] and alpha:
-            components["city"] = alpha[-1].strip().title()
-        if not components["district"] and len(alpha) >= 2:
-            components["district"] = alpha[-2].strip().title()
+    # NOTE: city / district are filled ONLY from their explicit labels (VTC /
+    # District). The old "guess the last two comma tokens" heuristic is gone —
+    # on a garbled address it produced confidently-wrong values (city="Avenue")
+    # and a wrong structured field is worse than an empty one. The full address
+    # string is always returned; downstream can re-parse if it needs more.
 
     conf = sum(confs) / len(confs) if confs else 0.0
     return full, conf, pin, care_of, care_of_relation, components

@@ -327,6 +327,18 @@ def _is_plausible_dob(iso: str) -> bool:
     return True
 
 
+def _dob_from_digits(chunk: str) -> str:
+    """Recover a DOB whose day/month separator OCR dropped, e.g. '2102/2002'
+    or '21022002' -> '2002-02-21'. Reads the first 8 digits as DDMMYYYY and
+    returns ISO only when the result is a plausible birth date (so a random
+    digit run can't masquerade as one)."""
+    digits = re.sub(r"\D", "", chunk)
+    if len(digits) < 8:
+        return ""
+    iso = f"{digits[4:8]}-{digits[2:4]}-{digits[0:2]}"
+    return iso if _is_plausible_dob(iso) else ""
+
+
 def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
     """Pick the date of birth from the card text.
 
@@ -343,6 +355,8 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
 
       1. a date whose preceding characters carry a DOB-style label (and not an
          issue label);
+      1b. a DOB-labelled date whose day/month separator OCR dropped
+         ('D0B: 2102/2002');
       2. a DOB/YOB label followed by a bare 4-digit year (year-of-birth card);
       3. the EARLIEST remaining plausible date — a person is always born
          before their card is issued or printed, so even when the issue
@@ -360,6 +374,18 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
             iso = _yyyy_mm_dd(raw)
             if _is_plausible_dob(iso):
                 return iso, False, raw
+
+    # 1b) a DOB-labelled date that lost its day/month separator in OCR
+    #     ('D0B：2102/2002', '21022002'). Anchored to an explicit DOB label and
+    #     gated by _is_plausible_dob so a stray digit run can't masquerade as a
+    #     birth date. The fullwidth colon '：' is common on phone-photo OCR.
+    loose = re.search(
+        r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH)\s*[:：\-]?\s*(\d[\d/\-.．]{5,11})",
+        full_text, re.I)
+    if loose:
+        iso = _dob_from_digits(loose.group(1))
+        if iso:
+            return iso, False, loose.group(1)
 
     # 2) a DOB / YOB label followed by a bare year (year-of-birth-only card)
     ym = re.search(

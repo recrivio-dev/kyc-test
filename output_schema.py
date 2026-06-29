@@ -379,8 +379,11 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
     #     ('D0B：2102/2002', '21022002'). Anchored to an explicit DOB label and
     #     gated by _is_plausible_dob so a stray digit run can't masquerade as a
     #     birth date. The fullwidth colon '：' is common on phone-photo OCR.
+    #     Internal spaces are allowed ('21 / 02 / 2002') but newlines are not,
+    #     so the run can't bleed into the Aadhaar number on the next line; only
+    #     the first 8 digits are used, so trailing junk is harmless.
     loose = re.search(
-        r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH)\s*[:：\-]?\s*(\d[\d/\-.．]{5,11})",
+        r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH)\s*[:：\-]?\s*(\d[\d/\-.．\t ]{5,14})",
         full_text, re.I)
     if loose:
         iso = _dob_from_digits(loose.group(1))
@@ -430,12 +433,14 @@ def _looks_like_aadhaar_name(text: str) -> bool:
     return letters >= 4 and letters / len(t) > 0.8
 
 
-# Same OCR-tolerant DOB label as _DOB_LABEL_RX, but it must be immediately
-# followed by an actual date so a stray '008'-like token can't anchor on its
-# own.
+# Same OCR-tolerant DOB label as _DOB_LABEL_RX, but it must be followed (after
+# any separators, including the fullwidth colon '：') by a date-like digit run —
+# 2 digits then another digit/separator. That requirement keeps a bare '008'
+# token or the boilerplate 'date of birth' sentence from anchoring, while still
+# matching a separator-mangled date like 'D0B：2102/2002'.
 _DOB_ANCHOR_RX = re.compile(
     r"(?:[D0O][O0][B8]|DATE\s*OF\s*BIRTH|YEAR\s*OF\s*BIRTH|YOB)"
-    r"[:\s/]*(?:[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}|\d{4}\b)",
+    r"[\s:：/.\-]*\d{2}[\d/\-.．]",
     re.I,
 )
 
@@ -684,6 +689,17 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
         gender = {"male": "M", "female": "F",
                   "transgender": "T"}[gm.group(1).lower()]
         g_conf = _conf_for(regions, gm.group(1))
+    else:
+        # Bilingual cards print the Hindi gender too; fall back to it when the
+        # English word was missed. (Devanagari is case-less, so the upper-cased
+        # full_text still contains it.)
+        for pat, code in ((r"पुरुष", "M"), (r"महिला|स्त्री", "F"),
+                          (r"ट्रांसजेंडर|किन्नर", "T")):
+            hm = re.search(pat, full_text)
+            if hm:
+                gender = code
+                g_conf = _conf_for(regions, hm.group(0))
+                break
 
     full_name, name_conf = _aadhaar_name(ordered)
 

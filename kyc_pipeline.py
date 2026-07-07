@@ -613,22 +613,31 @@ class DocumentPipeline:
         return ox1, oy1, ox2, oy2
 
     async def mask_identity(self, path: str, doc_type: str) -> Dict:
-        """Redact a document's ID number (keep last 4) and return the masked
-        image plus the masked-region geometry, both in the ORIGINAL uploaded
-        image's coordinate space — so a frontend that only has the original
-        (un-cropped, un-rotated) image can overlay the masks itself.
+        """Return two cropped + deskewed + upright ("work"-space) renders of
+        the document:
+
+          * ``unmasked_image`` — the clean cropped/rotated document, for
+            authorised/internal use (it shows the full ID number);
+          * ``masked_image``   — the same render with the ID number redacted
+            (last 4 kept), safe to display to a user.
+
+        Both share the SAME coordinate space, so ``masked_regions`` (also in
+        that space) overlay either image directly — no projection back to the
+        original upload is needed.
 
         `doc_type` is the internal upper-case key (AADHAAR / PAN / VOTER_ID /
-        PASSPORT / DRIVING_LICENSE). Safe-by-default: when nothing can be
-        confidently masked, `masked_image` is None so the caller fails closed
-        rather than publishing a maybe-unmasked image."""
+        PASSPORT / DRIVING_LICENSE). ``unmasked_image`` is present whenever the
+        document could be OCR-processed; ``masked_image`` is present only when
+        the ID number was located — it fails closed, so a "masked" render is
+        never a silently-unmasked one."""
         self._ensure_ocr()
         out: Dict = {
             "document_detected": False,
-            "masked_image": None,        # PNG bytes when masking succeeded
-            "masked_regions": [],
+            "unmasked_image": None,      # PNG bytes: cropped + rotated
+            "masked_image": None,        # PNG bytes: cropped + rotated + redacted
+            "masked_regions": [],        # [x, y, w, h] in the work-image space
             "message": None,
-            "status": 422,               # permanent-failure default (no retry)
+            "status": 200,
         }
         if not self.ocr_available:
             out.update(message="OCR backend unavailable", status=503)
@@ -640,10 +649,16 @@ class DocumentPipeline:
                        status=400)
             return out
 
-        # Preprocess for OCR while tracking original→work geometry, so masks
-        # found on the processed `work` image map back onto the original.
+        # crop → deskew → orient → resize. Both output images ARE this `work`
+        # render, so masks drawn on it need no projection back to the original.
         img = self.load_document_image(path)
-        work, T = await self._preprocess_with_transform(img)
+        work, _ = await self._preprocess_with_transform(img)
+
+        ok, buf = cv2.imencode(".png", work)
+        if not ok:
+            out.update(message="Failed to encode document image", status=500)
+            return out
+        out["unmasked_image"] = buf.tobytes()
 
         region_results = await self._locate_and_read(work)
         full_text = "\n".join(rr["text"] for rr in region_results
@@ -659,32 +674,27 @@ class DocumentPipeline:
                                     work.shape))
 
         if not work_rects:
+            # The unmasked render is still returned; the masked one is withheld
+            # (fail closed) so the caller never mistakes an unredacted image for
+            # a masked one.
             out["message"] = (
                 f"No {doc_type} identity number located"
                 if not extracted else
                 "Identity number found but could not be localized for masking")
             return out
 
-        # Project every mask box back onto the original image and draw there,
-        # so the returned image and regions share the caller's coordinates.
-        T_inv = np.linalg.inv(T)
-        masked = img.copy()
+        # The rectangles from _id_mask_rects are already in `work` space (final
+        # geometry, last-4 kept) — draw them straight onto the work render.
+        masked = work.copy()
         masked_regions: List[Dict] = []
         for (x1, y1, x2, y2, conf, field_name) in work_rects:
-            ox1, oy1, ox2, oy2 = self._project_box((x1, y1, x2, y2), T_inv,
-                                                   img.shape)
-            if ox2 <= ox1 or oy2 <= oy1:
-                continue
-            cv2.rectangle(masked, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
+            cv2.rectangle(masked, (int(x1), int(y1)), (int(x2), int(y2)),
+                          (0, 0, 0), -1)
             masked_regions.append({
                 "field": field_name,
-                "bbox": [ox1, oy1, ox2 - ox1, oy2 - oy1],
+                "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
                 "confidence": round(float(conf), 2),
             })
-
-        if not masked_regions:
-            out["message"] = "Located ID could not be mapped to the original image"
-            return out
 
         ok, buf = cv2.imencode(".png", masked)
         if not ok:

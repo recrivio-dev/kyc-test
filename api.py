@@ -136,14 +136,16 @@ async def mask_identity_endpoint(
     document_type: str = Form(...),
     client_id: Optional[str] = Form(None),
 ):
-    """Redact the document's ID number (keeping the last 4 chars) plus any
-    Aadhaar QR code, and return the masked image together with the masked
-    region geometry so a frontend can re-apply the mask client-side.
+    """Return two cropped + rotated (deskewed, upright) renders of the
+    document: ``unmasked_image`` (full ID visible — for authorised/internal
+    use) and ``masked_image`` (ID number redacted, last 4 kept — safe to
+    display). Both are base64 PNGs in the same coordinate space, alongside the
+    ``masked_regions`` geometry for client-side overlay.
 
-    Fails closed: if no document/number can be confidently located, the
-    response carries no ``masked_image`` and a 4xx (permanent) / 5xx
-    (transient) status — the caller must never publish a maybe-unmasked
-    image."""
+    ``masked_image`` fails closed: when no ID number can be confidently
+    located it is ``null`` (the ``unmasked_image`` is still returned). A 4xx /
+    5xx status is only raised when the document itself could not be processed
+    (bad type, OCR unavailable, encode failure)."""
     key = (document_type or "").strip().lower().replace("_", "-")
     internal = _MASK_DOC_MAP.get(key)
     if internal is None:
@@ -165,21 +167,29 @@ async def mask_identity_endpoint(
         except OSError:
             pass
 
-    # No masked image ⇒ failure. 4xx = permanent (don't retry), 5xx = transient.
-    if result.get("masked_image") is None:
+    # Document couldn't be processed at all ⇒ failure (bad type / OCR down /
+    # encode error). 4xx = permanent (don't retry), 5xx = transient.
+    if result.get("unmasked_image") is None:
         status = result.get("status", 422)
         return JSONResponse(
             content=failure_envelope(
-                result.get("message") or "identity masking failed",
+                result.get("message") or "document processing failed",
                 status=status),
             status_code=status,
         )
 
+    masked = result.get("masked_image")
     data = {
-        "masked_image": base64.b64encode(result["masked_image"]).decode("ascii"),
+        "unmasked_image": base64.b64encode(
+            result["unmasked_image"]).decode("ascii"),
+        # null when the ID could not be located (fails closed); the message
+        # then explains why nothing was redacted.
+        "masked_image": (base64.b64encode(masked).decode("ascii")
+                         if masked is not None else None),
         "mime_type": "image/png",
         "document_detected": result["document_detected"],
         "masked_regions": result["masked_regions"],
+        "message": result.get("message"),
         "client_id": client_id,
     }
     return JSONResponse(content=success_envelope(data), status_code=200)

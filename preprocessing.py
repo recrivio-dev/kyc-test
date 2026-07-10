@@ -206,63 +206,122 @@ def four_point_transform(img: np.ndarray, quad: np.ndarray) -> np.ndarray | None
     return cv2.warpPerspective(img, M, (width, height))
 
 
-def _foreground_mask(small: np.ndarray, delta: int = 40) -> np.ndarray:
-    """Mask of pixels that differ from the background colour.
+def _texture_energy(gray: np.ndarray) -> np.ndarray:
+    """Per-pixel edge energy (0/1). A document is densely printed; a desk,
+    hand or soft shadow is smooth — so texture separates them even when their
+    colours are nearly identical."""
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    mag = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return (mag > 30).astype(np.uint8)
 
-    The background colour is estimated from the image border ring (a document
-    photo virtually never touches all four edges). This beats Canny for
-    document detection: Canny latches onto strong *inner* rectangles (a framed
-    paragraph, a photo box) whose contour is larger than the card's own faint
-    outer edge, which is exactly how a crop ends up amputating the card."""
+
+def _candidate_masks(small: np.ndarray) -> dict:
+    """Three independent document masks. None is reliable alone:
+
+      * colordiff — background colour estimated from the border ring. Great on
+        a contrasting background, but a soft shadow also 'differs' and gets
+        merged into the card.
+      * texture   — Sobel energy, morphologically closed. Finds the printed
+        body; immune to shadows. The workhorse for a white card on a white desk.
+      * canny     — classic edges. Sharp on a clear border, but latches onto
+        strong *inner* rectangles (a framed paragraph) and then amputates.
+    """
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    out = {}
+
     border = np.concatenate([small[0, :], small[-1, :],
                              small[:, 0], small[:, -1]])
     bg = np.median(border, axis=0)
     diff = np.abs(small.astype(np.int16) - bg.astype(np.int16)).sum(axis=2)
-    mask = (diff > delta).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    out["colordiff"] = cv2.morphologyEx(
+        (diff > 40).astype(np.uint8) * 255, cv2.MORPH_CLOSE,
+        np.ones((9, 9), np.uint8), iterations=2)
+
+    out["texture"] = cv2.morphologyEx(
+        _texture_energy(gray) * 255, cv2.MORPH_CLOSE,
+        np.ones((25, 25), np.uint8), iterations=2)
+
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    out["canny"] = cv2.dilate(edges, np.ones((7, 7), np.uint8), iterations=2)
+    return out
+
+
+def _quad_score(rect, tex: np.ndarray) -> float:
+    """How document-like is this rect? Texture density inside minus outside.
+
+    A rect snapped to the real card is dense inside and sits on a smooth
+    background; one that swallowed a shadow dilutes its inside density."""
+    h, w = tex.shape[:2]
+    poly = cv2.boxPoints(rect).astype(np.int32)
+    inside = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(inside, poly, 1)
+    n_in = int(inside.sum())
+    n_out = h * w - n_in
+    if n_in < 0.02 * h * w:
+        return -1.0
+    d_in = float((tex * inside).sum()) / n_in
+    d_out = float((tex * (1 - inside)).sum()) / n_out if n_out > 0 else 0.0
+    return d_in - d_out
 
 
 def detect_document_quad(img: np.ndarray,
-                         min_area_ratio: float = 0.10,
-                         aspect_range: tuple = (1.05, 2.80),
+                         min_area_ratio: float = 0.08,
+                         aspect_range: tuple = (1.10, 2.60),
                          pad_ratio: float = 0.015):
     """Locate the document as a rotated quadrilateral in original-image coords.
 
-    Returns (quad_4x2 | None, debug). A candidate is accepted only when it
-    covers at least `min_area_ratio` of the frame and its long/short side ratio
-    looks like a real document (an ID card is ~1.58, an e-card page ~1.2)."""
+    Builds several candidate masks, keeps every candidate whose rect covers at
+    least `min_area_ratio` of the frame and whose long/short ratio looks like a
+    real document (ID card ~1.58, e-card page ~1.21), then picks the one that
+    scores best on texture-inside-vs-outside. Returns (quad_4x2 | None, debug).
+    """
     h, w = img.shape[:2]
     scale = 800.0 / max(h, w) if max(h, w) > 800 else 1.0
     small = cv2.resize(img, (int(w * scale), int(h * scale)),
                        interpolation=cv2.INTER_AREA)
-    mask = _foreground_mask(small)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, {"reason": "no foreground contour"}
-
-    cnt = max(contours, key=cv2.contourArea)
+    tex = _texture_energy(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
     frame_area = float(small.shape[0] * small.shape[1])
-    area_ratio = cv2.contourArea(cnt) / frame_area
-    if area_ratio < min_area_ratio:
-        return None, {"reason": f"area_ratio {area_ratio:.2f} < {min_area_ratio}"}
 
-    (cx, cy), (rw, rh), angle = cv2.minAreaRect(cnt)
-    if rw < 1 or rh < 1:
-        return None, {"reason": "degenerate rect"}
-    aspect = max(rw, rh) / min(rw, rh)
-    if not (aspect_range[0] <= aspect <= aspect_range[1]):
-        return None, {"reason": f"aspect {aspect:.2f} outside {aspect_range}"}
+    best = None
+    rejected = {}
+    for name, mask in _candidate_masks(small).items():
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            rejected[name] = "no contour"
+            continue
+        cnt = max(contours, key=cv2.contourArea)
+        area_ratio = cv2.contourArea(cnt) / frame_area
+        if area_ratio < min_area_ratio:
+            rejected[name] = f"area {area_ratio:.2f}"
+            continue
+        rect = cv2.minAreaRect(cnt)
+        (_, _), (rw, rh), angle = rect
+        if min(rw, rh) < 1:
+            rejected[name] = "degenerate"
+            continue
+        aspect = max(rw, rh) / min(rw, rh)
+        if not (aspect_range[0] <= aspect <= aspect_range[1]):
+            rejected[name] = f"aspect {aspect:.2f}"
+            continue
+        score = _quad_score(rect, tex)
+        if best is None or score > best[0]:
+            best = (score, name, rect, area_ratio, aspect, angle)
 
+    if best is None:
+        return None, {"reason": "no candidate passed", "rejected": rejected}
+
+    score, name, rect, area_ratio, aspect, angle = best
+    (cx, cy), (rw, rh), _ = rect
     # Pad outward so a tight contour never shaves off border characters.
-    rw *= (1.0 + 2 * pad_ratio)
-    rh *= (1.0 + 2 * pad_ratio)
-    quad = cv2.boxPoints(((cx, cy), (rw, rh), angle)) / scale
-    # Skew of the rect relative to the axes (0 for an upright rect).
+    quad = cv2.boxPoints(((cx, cy),
+                          (rw * (1 + 2 * pad_ratio), rh * (1 + 2 * pad_ratio)),
+                          angle)) / scale
     skew = min(abs(angle), abs(abs(angle) - 90.0))
-    return quad, {"area_ratio": round(area_ratio, 3),
+    return quad, {"source": name, "score": round(score, 3),
+                  "area_ratio": round(area_ratio, 3),
                   "aspect": round(aspect, 3),
                   "angle": round(angle, 2), "skew": round(skew, 2)}
 

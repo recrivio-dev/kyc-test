@@ -30,7 +30,8 @@ from config import SETTINGS, Settings
 from layout_detector import LayoutDetector, Region
 from ocr_engines import RapidOCREngine, SuryaOCREngine, run_extract_async
 from output_schema import build_output_json, failure_envelope
-from preprocessing import auto_crop_document, deskew, resize_for_ocr, rotate_image
+from preprocessing import (auto_crop_document, crop_document, deskew,
+                          resize_for_ocr, rotate_image)
 
 
 class DocumentPipeline:
@@ -558,6 +559,29 @@ class DocumentPipeline:
             T = np.eye(3, dtype=float)
         return T, rotated
 
+    async def _preprocess_for_display(self, img: np.ndarray) -> np.ndarray:
+        """Produce the render returned to the caller by /mask-identity:
+        the document cropped out of its background, straightened, stood
+        upright, and sized for OCR.
+
+        Unlike `_preprocess_with_transform` (used by the OCR contract, whose
+        `auto_crop_document` deliberately refuses any crop that would drop
+        >30% of the frame) this uses `crop_document`, which finds the document
+        quad against the background and perspective-warps it. That is what
+        actually crops a card photographed on a desk/hand — the conservative
+        bbox crop always bailed out and returned the full original.
+
+        Every mask rectangle is computed on this render, so the returned
+        masked/unmasked images and `masked_regions` all share its coordinates.
+        """
+        cropped, _dbg = crop_document(img)
+        # Residual skew (the quad warp already removes rotation; this is a
+        # no-op on a straight image, and it rescues the fallback crop path).
+        straight, _ = deskew(cropped)
+        angle = await self._detect_orientation(straight)
+        upright = rotate_image(straight, angle)
+        return resize_for_ocr(upright, max_side=self.settings.work_max_side)
+
     async def _preprocess_with_transform(self, img: np.ndarray):
         """Run the same crop→deskew→orient→resize chain as process_and_verify,
         but also accumulate the 3×3 affine that maps ORIGINAL image coords to
@@ -649,10 +673,11 @@ class DocumentPipeline:
                        status=400)
             return out
 
-        # crop → deskew → orient → resize. Both output images ARE this `work`
-        # render, so masks drawn on it need no projection back to the original.
+        # crop → straighten → orient → resize. Both output images ARE this
+        # `work` render, so masks drawn on it need no projection back to the
+        # original upload.
         img = self.load_document_image(path)
-        work, _ = await self._preprocess_with_transform(img)
+        work = await self._preprocess_for_display(img)
 
         ok, buf = cv2.imencode(".png", work)
         if not ok:

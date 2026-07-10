@@ -177,6 +177,123 @@ def auto_crop_document(
     return img_bgr, debug
 
 
+def _order_quad(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points as top-left, top-right, bottom-right, bottom-left."""
+    pts = np.asarray(pts, dtype="float32")
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]          # tl has the smallest x+y
+    rect[2] = pts[np.argmax(s)]          # br has the largest  x+y
+    d = np.diff(pts, axis=1).ravel()     # y - x
+    rect[1] = pts[np.argmin(d)]          # tr
+    rect[3] = pts[np.argmax(d)]          # bl
+    return rect
+
+
+def four_point_transform(img: np.ndarray, quad: np.ndarray) -> np.ndarray | None:
+    """Warp the quadrilateral `quad` (4×2, original-image coords) to a
+    straight, axis-aligned rectangle. This crops to the document AND removes
+    its rotation/perspective in one step."""
+    rect = _order_quad(quad)
+    tl, tr, br, bl = rect
+    width = int(round(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))))
+    height = int(round(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))))
+    if width < 10 or height < 10:
+        return None
+    dst = np.array([[0, 0], [width - 1, 0],
+                    [width - 1, height - 1], [0, height - 1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (width, height))
+
+
+def _foreground_mask(small: np.ndarray, delta: int = 40) -> np.ndarray:
+    """Mask of pixels that differ from the background colour.
+
+    The background colour is estimated from the image border ring (a document
+    photo virtually never touches all four edges). This beats Canny for
+    document detection: Canny latches onto strong *inner* rectangles (a framed
+    paragraph, a photo box) whose contour is larger than the card's own faint
+    outer edge, which is exactly how a crop ends up amputating the card."""
+    border = np.concatenate([small[0, :], small[-1, :],
+                             small[:, 0], small[:, -1]])
+    bg = np.median(border, axis=0)
+    diff = np.abs(small.astype(np.int16) - bg.astype(np.int16)).sum(axis=2)
+    mask = (diff > delta).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+
+def detect_document_quad(img: np.ndarray,
+                         min_area_ratio: float = 0.10,
+                         aspect_range: tuple = (1.05, 2.80),
+                         pad_ratio: float = 0.015):
+    """Locate the document as a rotated quadrilateral in original-image coords.
+
+    Returns (quad_4x2 | None, debug). A candidate is accepted only when it
+    covers at least `min_area_ratio` of the frame and its long/short side ratio
+    looks like a real document (an ID card is ~1.58, an e-card page ~1.2)."""
+    h, w = img.shape[:2]
+    scale = 800.0 / max(h, w) if max(h, w) > 800 else 1.0
+    small = cv2.resize(img, (int(w * scale), int(h * scale)),
+                       interpolation=cv2.INTER_AREA)
+    mask = _foreground_mask(small)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, {"reason": "no foreground contour"}
+
+    cnt = max(contours, key=cv2.contourArea)
+    frame_area = float(small.shape[0] * small.shape[1])
+    area_ratio = cv2.contourArea(cnt) / frame_area
+    if area_ratio < min_area_ratio:
+        return None, {"reason": f"area_ratio {area_ratio:.2f} < {min_area_ratio}"}
+
+    (cx, cy), (rw, rh), angle = cv2.minAreaRect(cnt)
+    if rw < 1 or rh < 1:
+        return None, {"reason": "degenerate rect"}
+    aspect = max(rw, rh) / min(rw, rh)
+    if not (aspect_range[0] <= aspect <= aspect_range[1]):
+        return None, {"reason": f"aspect {aspect:.2f} outside {aspect_range}"}
+
+    # Pad outward so a tight contour never shaves off border characters.
+    rw *= (1.0 + 2 * pad_ratio)
+    rh *= (1.0 + 2 * pad_ratio)
+    quad = cv2.boxPoints(((cx, cy), (rw, rh), angle)) / scale
+    # Skew of the rect relative to the axes (0 for an upright rect).
+    skew = min(abs(angle), abs(abs(angle) - 90.0))
+    return quad, {"area_ratio": round(area_ratio, 3),
+                  "aspect": round(aspect, 3),
+                  "angle": round(angle, 2), "skew": round(skew, 2)}
+
+
+def crop_document(img: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Crop to the document and remove its rotation/perspective.
+
+    Strategy: detect the document quad on a background-difference mask and warp
+    it to a straight rectangle. When the document already fills the frame
+    squarely there is nothing to gain, so the original is returned untouched
+    (avoiding a needless resample). If no quad is trustworthy we fall back to
+    the conservative `auto_crop_document`, and finally to the original — an
+    over-crop destroys the document, so the full frame is the safe failure."""
+    h, w = img.shape[:2]
+    quad, dbg = detect_document_quad(img)
+
+    if quad is not None:
+        quad_area = cv2.contourArea(quad.astype(np.float32)) / float(w * h)
+        # Already a tight, square-on document → don't resample it.
+        if quad_area >= 0.985 and dbg.get("skew", 90) < 1.0:
+            return img, {**dbg, "cropped": False, "method": "already_tight"}
+        warped = four_point_transform(img, quad)
+        if warped is not None:
+            return warped, {**dbg, "cropped": True, "method": "quad_warp"}
+        dbg["reason"] = "warp failed"
+
+    cropped, adbg = auto_crop_document(img)
+    return cropped, {**adbg, "method": "auto_crop_fallback",
+                     "quad_reject": dbg.get("reason")}
+
+
 def estimate_skew_angle(gray: np.ndarray) -> float:
     """Estimate skew angle in degrees using Hough lines on edges."""
     # edges

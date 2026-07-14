@@ -22,10 +22,13 @@ The response body is exactly the contract documented in
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import tempfile
 from typing import Literal, Optional
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -59,15 +62,74 @@ app.add_middleware(
 # One pipeline instance for the process lifetime — the OCR models load once.
 _pipeline = DocumentPipeline()
 
+# Deep-readiness state. `/healthz` returns 200 only when the models are loaded
+# AND a startup self-test drove a document through the ENTIRE pipeline without
+# raising. The old check reported healthy on "models loaded" alone, so a build
+# that boots but 500s on every request (the July-2026 estimate_skew_angle
+# regression) went green and silently served errors. Now such a build never
+# becomes healthy — the container is caught at deploy time, not by users.
+_selftest_ok = False
+_selftest_error: "str | None" = None
+
+
+def _selftest_image() -> "np.ndarray":
+    """A tiny synthetic PAN-like card (light background, dark text, a border) —
+    enough to drive preprocess → crop → deskew (HoughLinesP) → locate → classify
+    without bundling a fixture in the image. We assert only that it runs cleanly,
+    not what it extracts."""
+    img = np.full((260, 430, 3), 245, np.uint8)
+    cv2.rectangle(img, (8, 8), (421, 251), (60, 60, 60), 2)
+    for i, line in enumerate((
+        "INCOME TAX DEPARTMENT",
+        "Permanent Account Number Card",
+        "ABCDE1234F",
+        "RAHUL GUPTA",
+        "01/01/1990",
+    )):
+        cv2.putText(img, line, (22, 46 + i * 42), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (20, 20, 20), 2, cv2.LINE_AA)
+    return img
+
 
 @app.on_event("startup")
-def _warmup() -> None:
+async def _warmup() -> None:
+    global _selftest_ok, _selftest_error
     _pipeline._ensure_ocr()
+    # Run the full OCR path once on a synthetic doc. Any exception here means the
+    # deploy is broken at runtime — report unhealthy instead of serving 500s.
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        cv2.imwrite(path, _selftest_image())
+        await _pipeline.process_and_verify(path, "PAN")
+        _selftest_ok, _selftest_error = True, None
+    except Exception as exc:  # any failure ⇒ not ready
+        _selftest_ok = False
+        _selftest_error = f"{type(exc).__name__}: {exc}"
+        logging.getLogger("uvicorn.error").error(
+            "OCR startup self-test FAILED — reporting unhealthy: %s", _selftest_error)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": _pipeline.ocr_available}
+    # 200 only when models are loaded AND the pipeline self-test passed, so a
+    # boots-but-crashes build never reports healthy. 503 flips the Docker
+    # healthcheck (and any load balancer) to unhealthy.
+    ok = bool(_pipeline.ocr_available and _selftest_ok)
+    return JSONResponse(
+        content={
+            "ok": ok,
+            "ocr_available": _pipeline.ocr_available,
+            "selftest_ok": _selftest_ok,
+            "selftest_error": _selftest_error,
+        },
+        status_code=200 if ok else 503,
+    )
 
 
 async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:

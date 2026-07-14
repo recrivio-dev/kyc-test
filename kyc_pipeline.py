@@ -385,6 +385,41 @@ class DocumentPipeline:
 
     # ── Stage 4: direct masking via layout boxes ─────────────────────────────
 
+    def _is_id_hit(self, text: str, pattern: str, id_clean: str,
+                   doc_type: str) -> bool:
+        """Does this recognised region hold the ID number, or part of it?"""
+        up = text.upper()
+        word = re.sub(r"[^A-Z0-9]", "", up)
+        if not word:
+            return False
+        if re.search(pattern, up):
+            return True
+        if not id_clean:
+            return False
+        # whole ID inside the crop, or crop is a long ID fragment
+        if id_clean in word or (len(word) >= 6 and word in id_clean):
+            return True
+        # Aadhaar sets the 12 digits as three space-separated 4-digit groups.
+        # A detector that splits on those gaps returns 4-char crops, which the
+        # 12-digit pattern cannot match and the >=6 fragment rule rejects — so
+        # a wide-set number got no hits at all and the card went out unmasked.
+        # _merge_nearby_boxes rejoins the groups into one box afterwards.
+        return (doc_type == "AADHAAR" and len(word) >= 4
+                and word.isdigit() and word in id_clean)
+
+    def _merge_gap_for(self, doc_type: str, boxes) -> int:
+        """Join distance handed to _merge_nearby_boxes.
+
+        Aadhaar's digit groups sit roughly a character-width apart, which on a
+        high-resolution scan is wider than the flat `merge_gap` — leaving three
+        separately-masked groups instead of one box. Scale the gap to the glyph
+        height so the groups merge however large the card was scanned."""
+        gap = self.settings.mask.merge_gap
+        if doc_type != "AADHAAR" or not boxes:
+            return gap
+        heights = sorted(y2 - y1 for (_, y1, _, y2) in boxes)
+        return max(gap, int(1.2 * heights[len(heights) // 2]))
+
     def _sensitive_boxes(self, region_results: List[Dict], doc_type: str,
                          extracted_id: str) -> List[Tuple[int, int, int, int]]:
         """Pick the layout regions that hold the sensitive ID.
@@ -394,21 +429,8 @@ class DocumentPipeline:
         """
         pattern = self.patterns[doc_type]
         id_clean = re.sub(r"[^A-Z0-9]", "", extracted_id.upper())
-        hits: List[Tuple[int, int, int, int]] = []
-
-        for rr in region_results:
-            up = rr["text"].upper()
-            word = re.sub(r"[^A-Z0-9]", "", up)
-            if not word:
-                continue
-            is_hit = bool(re.search(pattern, up))
-            if not is_hit and id_clean:
-                # whole ID inside the crop, or crop is a long ID fragment
-                is_hit = (id_clean in word
-                          or (len(word) >= 6 and word in id_clean))
-            if is_hit:
-                hits.append(rr["region"].bbox)
-        return hits
+        return [rr["region"].bbox for rr in region_results
+                if self._is_id_hit(rr["text"], pattern, id_clean, doc_type)]
 
     def _merge_nearby_boxes(self, boxes, gap: int):
         """Join boxes on the same row within `gap` px (Aadhaar's 3 groups)."""
@@ -440,9 +462,9 @@ class DocumentPipeline:
         h, w = masked.shape[:2]
         ms = self.settings.mask
 
+        raw = self._sensitive_boxes(region_results, doc_type, extracted_id)
         boxes = self._merge_nearby_boxes(
-            self._sensitive_boxes(region_results, doc_type, extracted_id),
-            gap=ms.merge_gap,
+            raw, gap=self._merge_gap_for(doc_type, raw),
         )
         drawn = 0
 
@@ -505,15 +527,12 @@ class DocumentPipeline:
             word = re.sub(r"[^A-Z0-9]", "", rr["text"].upper())
             if not word:
                 continue
-            is_hit = bool(re.search(pattern, rr["text"].upper()))
-            if not is_hit and id_clean:
-                is_hit = (id_clean in word
-                          or (len(word) >= 6 and word in id_clean))
-            if is_hit:
+            if self._is_id_hit(rr["text"], pattern, id_clean, doc_type):
                 hits.append((rr["region"].bbox, rr["conf"], len(word)))
 
-        merged = self._merge_nearby_boxes([b for b, _, _ in hits],
-                                          gap=ms.merge_gap)
+        boxes = [b for b, _, _ in hits]
+        merged = self._merge_nearby_boxes(
+            boxes, gap=self._merge_gap_for(doc_type, boxes))
         rects: List[Tuple] = []
         for (x1, y1, x2, y2) in merged:
             conf, nchars = self._box_agg((x1, y1, x2, y2), hits)

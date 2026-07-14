@@ -525,6 +525,44 @@ _ADDR_LABEL_RX = re.compile(r"A[D0O]{1,2}R[A-Z]*S{1,2}|पता", re.I)
 _ADDR_FOOTER_RX = re.compile(
     r"VID[:\s]|MOBILE|UIDAI|WWW\.|HELP@|@|ENROL|\b1947\b|GOV\.?\s*IN", re.I)
 
+_VOWELS = frozenset("AEIOUY")
+
+
+def _is_script_garbage(t: str) -> bool:
+    """True for a line the Latin recogniser hallucinated out of Indic script.
+
+    The recogniser only carries ch/en models, so a Gujarati or Devanagari line
+    is not dropped — it is transliterated into look-alike Latin at a confidence
+    well above the score gate ('સરનામું' → 'eHeHlg'). Aadhaar prints its address
+    twice, once per script, so those junk lines land in the same x-column as the
+    real English ones, carry the same S/O marker and the same PIN, and end up
+    merged into the address (and the care-of name) ahead of the English text.
+
+    Two signals condemn a line; either is enough:
+
+      * case chaos — an uppercase letter inside a token that started lowercase
+        ('wHelqle', 'HlHl'). Printed text is Titlecase, lowercase or ALLCAPS.
+      * vowel-less tokens — 'ql', 'qT', 'slsq'. Latin address words nearly all
+        carry a vowel; a few abbreviations (NR, VTC) do not, so this only fires
+        when such tokens dominate the line.
+
+    The Indic PIN line is a third case: 'ગુજરાત - 382330' comes back as
+    'd - 382330', where the state name has collapsed to a stray letter and the
+    two signals above have no tokens left to weigh. A PIN line carrying one or
+    two letters of alphabetic content is that collapse — a real one prints
+    either a bare PIN ('382330') or a whole state name ('Gujarat - 382330').
+    """
+    letters = re.sub(r"[^A-Za-z]", "", t)
+    if re.search(r"\b\d{6}\b", t) and 1 <= len(letters) <= 2:
+        return True
+    tokens = re.findall(r"[A-Za-z]{2,}", t)
+    if not tokens:
+        return False
+    if sum(1 for w in tokens if re.search(r"[a-z][A-Z]", w)) >= 2:
+        return True
+    vowelless = sum(1 for w in tokens if not (set(w.upper()) & _VOWELS))
+    return len(tokens) >= 3 and vowelless / len(tokens) >= 0.4
+
 
 def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
@@ -553,6 +591,10 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         """Aadhaar / VID numbers print near the address — never part of it."""
         d = re.sub(r"\D", "", t)
         return len(d) >= 11 or bool(digits_aadhaar and digits_aadhaar in d)
+
+    # Drop the transliterated Indic block before either strategy sees it, so
+    # both score on the English address alone.
+    ordered = [r for r in ordered if not _is_script_garbage(r["text"])]
 
     results: List[Tuple] = []
 
@@ -615,6 +657,41 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
     return max(results, key=lambda res: (1 if res[2] else 0, len(res[0])))
 
 
+# Cards print the district label as 'DIST' at least as often as 'District'.
+# 'Sub District' is a different administrative level and must never fill it.
+_DIST_LABEL_RX = re.compile(r"\bDIST(?:RICT)?\b", re.I)
+_SUBDIST_RX = re.compile(r"\bSUB[\s.-]*DIST(?:RICT)?\b", re.I)
+_VTC_LABEL_RX = re.compile(r"\bVTC\b", re.I)
+_CITY_SUFFIX_RX = re.compile(r"^(.+?)\s+CITY$", re.I)
+# A place name: letters only. Rejects a wrapped-past-the-label segment that is
+# really the PIN line ('Gujarat - 382330') or a house number.
+_PLACE_RX = re.compile(r"^[A-Za-z][A-Za-z\s.]{1,40}$")
+
+
+def _labelled_place(segments: List[str], label_rx: re.Pattern,
+                    skip_rx: re.Pattern | None = None) -> str:
+    """Value printed against a label, across the UIDAI line wrap.
+
+    The English block wraps mid-label, so the label routinely ends its printed
+    line and the value opens the next one — joined here as two comma segments
+    ('… , PO: Nana Chiloda, DIST:, Ahmedabad, …'). Matching label-then-value
+    within one segment misses that entirely, so fall through to the following
+    segment whenever the label's own segment carries no value.
+    """
+    for i, seg in enumerate(segments):
+        if skip_rx is not None and skip_rx.search(seg):
+            continue
+        m = label_rx.search(seg)
+        if not m:
+            continue
+        val = seg[m.end():].strip(" .:-")
+        if not val and i + 1 < len(segments):
+            val = segments[i + 1].strip(" .:-")
+        if _PLACE_RX.match(val):
+            return _clean_name(val)
+    return ""
+
+
 def _assemble_address(parts: List[str], confs: List[float],
                       aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
@@ -667,19 +744,26 @@ def _assemble_address(parts: List[str], confs: List[float],
         components["house_number"] = re.sub(r"^[A-Za-z]-?", "", hn.group(1))
 
     # District / city from their labelled segments where present.
-    dm = re.search(r"\bDISTRICT[.:\s]+([A-Za-z][A-Za-z\s]*?)\s*[,;]",
-                   full, re.I)
-    if dm:
-        components["district"] = _clean_name(dm.group(1))
-    vm = re.search(r"\bVTC[.:\s]*([A-Za-z][A-Za-z\s]*?)\s*[,;]", full, re.I)
-    if vm:
-        components["city"] = _clean_name(vm.group(1))
+    segments = [s for s in re.split(r"\s*,\s*", full) if s.strip()]
+    components["district"] = _labelled_place(
+        segments, _DIST_LABEL_RX, skip_rx=_SUBDIST_RX)
+    components["city"] = _labelled_place(segments, _VTC_LABEL_RX)
+    if not components["city"]:
+        # Backs that carry no VTC label print the town as its own segment,
+        # 'Ahmedabad City'. Anchored at both ends so a road name ('Nr City
+        # Light Road') can never be mistaken for the city.
+        for seg in segments:
+            m = _CITY_SUFFIX_RX.match(seg.strip())
+            if m and _PLACE_RX.match(m.group(1)):
+                components["city"] = _clean_name(m.group(1))
+                break
 
     # NOTE: city / district are filled ONLY from their explicit labels (VTC /
-    # District). The old "guess the last two comma tokens" heuristic is gone —
-    # on a garbled address it produced confidently-wrong values (city="Avenue")
-    # and a wrong structured field is worse than an empty one. The full address
-    # string is always returned; downstream can re-parse if it needs more.
+    # District / 'X City'). The old "guess the last two comma tokens" heuristic
+    # is gone — on a garbled address it produced confidently-wrong values
+    # (city="Avenue") and a wrong structured field is worse than an empty one.
+    # The full address string is always returned; downstream can re-parse if it
+    # needs more.
 
     conf = sum(confs) / len(confs) if confs else 0.0
     return full, conf, pin, care_of, care_of_relation, components

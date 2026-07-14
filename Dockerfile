@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # ---------- Stage 1: builder ----------
-FROM python:3.11-slim AS builder
+# Pin to bookworm (Debian 12). The bare `python:3.11-slim` tag moved to trixie
+# (Debian 13), where `libgl1` no longer ships libGL.so.1 and `import cv2` fails
+# at boot. Bookworm is the environment the known-good images were built on.
+FROM python:3.11-slim-bookworm AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -28,7 +31,9 @@ RUN pip install -r requirements.txt \
  && pip install gunicorn==23.0.0
 
 # ---------- Stage 2: runtime ----------
-FROM python:3.11-slim AS runtime
+# Pinned to bookworm — see the builder stage note. libgl1 provides libGL.so.1
+# here (opencv needs it at import); trixie does not.
+FROM python:3.11-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

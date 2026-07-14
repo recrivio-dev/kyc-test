@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -527,41 +528,65 @@ _ADDR_FOOTER_RX = re.compile(
 
 _VOWELS = frozenset("AEIOUY")
 
+# A segment that is nothing but a printed label. OCR sometimes splits the label
+# off its value into its own region ('VTC:' | 'Chandigarh'), and such a line has
+# no readable word by design — it must survive the garbage filter or the value
+# it introduces loses its label.
+_LABEL_ONLY_RX = re.compile(
+    r"^[\s:.,\-]*(?:C/O|S/O|D/O|W/O|VTC|P\.?\s*O|SUB\s*DIST(?:RICT)?|"
+    r"DIST(?:RICT)?|PIN\s*CODE|PIN|STATE|HOUSE\s*NO|H\.?\s*NO)[\s:.,\-]*$",
+    re.I)
+
+
+def _is_plausible_word(w: str) -> bool:
+    """Could the English address block have printed this word?
+
+    Split camelCase first: OCR routinely welds two real words into one token
+    ('UtarPradesh'), and judging the weld as a single word would condemn a
+    perfectly good line. A real word is three-plus letters with a vowel.
+    """
+    for sub in re.split(r"(?<=[a-z])(?=[A-Z])", w):
+        if len(sub) >= 3 and set(sub.upper()) & _VOWELS:
+            return True
+    return False
+
 
 def _is_script_garbage(t: str) -> bool:
-    """True for a line the Latin recogniser hallucinated out of Indic script.
+    """True for a line the Latin recogniser hallucinated out of an Indic script.
 
-    The recogniser only carries ch/en models, so a Gujarati or Devanagari line
-    is not dropped — it is transliterated into look-alike Latin at a confidence
-    well above the score gate ('સરનામું' → 'eHeHlg'). Aadhaar prints its address
-    twice, once per script, so those junk lines land in the same x-column as the
-    real English ones, carry the same S/O marker and the same PIN, and end up
-    merged into the address (and the care-of name) ahead of the English text.
+    Aadhaar prints its address twice — once in the holder's regional language,
+    once in English — and the recogniser carries only ch/en models. The regional
+    block is therefore not rejected but *transliterated* into look-alike Latin
+    at a confidence well above the score gate, differently per script:
 
-    Two signals condemn a line; either is enough:
+        Gujarati   'સરનામું'            -> 'HeHly'
+        Devanagari 'S/O: ईश्वरलाल, डी-404' -> 'S/O: aaR, -404, 3Tq at'
+        Tamil      'S/O: ஈஸ்வரலால்…'      -> 'S/O:下6, -404, 6T6,'
+        Kannada    'S/O: ಈಶ್ವರಲಾಲ್…'      -> 'S/O:α，-404，0'
 
-      * case chaos — an uppercase letter inside a token that started lowercase
-        ('wHelqle', 'HlHl'). Printed text is Titlecase, lowercase or ALLCAPS.
-      * vowel-less tokens — 'ql', 'qT', 'slsq'. Latin address words nearly all
-        carry a vowel; a few abbreviations (NR, VTC) do not, so this only fires
-        when such tokens dominate the line.
+    These land in the same x-column as the English lines and carry the same
+    S/O marker and the same PIN, so they join the address cluster and feed the
+    care-of name ahead of the English text. Two script-agnostic signals:
 
-    The Indic PIN line is a third case: 'ગુજરાત - 382330' comes back as
-    'd - 382330', where the state name has collapsed to a stray letter and the
-    two signals above have no tokens left to weigh. A PIN line carrying one or
-    two letters of alphabetic content is that collapse — a real one prints
-    either a bare PIN ('382330') or a whole state name ('Gujarat - 382330').
+      * foreign letters — the ch/en recogniser reaches for CJK and Greek glyphs
+        ('中', 'α', 'の') that English print never contains. Letters only:
+        stray full-width punctuation ('（') does occur in genuine lines.
+      * no readable word — whatever Latin it did emit forms no real word. Only
+        condemn on this when the line would otherwise matter: it carries an
+        address marker (so it would join the cluster), or it holds enough
+        letters that their emptiness is not just a short numeric fragment.
+
+    A line with no letters at all ('395017', 'D-404') is left for the caller to
+    judge — it may be a genuine bare PIN or house number.
     """
-    letters = re.sub(r"[^A-Za-z]", "", t)
-    if re.search(r"\b\d{6}\b", t) and 1 <= len(letters) <= 2:
+    if any(ord(c) > 127 and unicodedata.category(c).startswith("L") for c in t):
         return True
-    tokens = re.findall(r"[A-Za-z]{2,}", t)
-    if not tokens:
+    words = re.findall(r"[A-Za-z]+", t)
+    if not words or any(_is_plausible_word(w) for w in words):
         return False
-    if sum(1 for w in tokens if re.search(r"[a-z][A-Z]", w)) >= 2:
-        return True
-    vowelless = sum(1 for w in tokens if not (set(w.upper()) & _VOWELS))
-    return len(tokens) >= 3 and vowelless / len(tokens) >= 0.4
+    if _LABEL_ONLY_RX.match(t.strip()):
+        return False
+    return _is_aadhaar_addr_line(t) or len("".join(words)) >= 3
 
 
 def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
@@ -592,11 +617,27 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         d = re.sub(r"\D", "", t)
         return len(d) >= 11 or bool(digits_aadhaar and digits_aadhaar in d)
 
-    # Drop the transliterated Indic block before either strategy sees it, so
-    # both score on the English address alone.
+    # Drop the transliterated regional-language block before either strategy
+    # sees it, so both score on the English address alone.
     ordered = [r for r in ordered if not _is_script_garbage(r["text"])]
 
-    results: List[Tuple] = []
+    # Some scripts collapse their PIN line to bare digits ('ওয়েস্ট বেঙ্গল - 713205'
+    # -> '-713205'), which is indistinguishable from a genuine bare-PIN line
+    # ('395017') on its own — but it is a *duplicate*: the English block prints
+    # that same PIN next to its state name. Drop a word-less PIN line only when
+    # the PIN is already carried by a line that has words.
+    def _pin_of(text: str) -> str:
+        m = re.search(r"\b(\d{6})\b", text)
+        return m.group(1) if m else ""
+
+    worded_pins = {_pin_of(r["text"]) for r in ordered
+                   if re.search(r"[A-Za-z]{3,}", r["text"])} - {""}
+    ordered = [r for r in ordered
+               if re.search(r"[A-Za-z]{3,}", r["text"])
+               or _pin_of(r["text"]) not in worded_pins]
+
+    # (assembled_result, came_from_the_label_anchored_span)
+    results: List[Tuple[Tuple, bool]] = []
 
     # ── strategy 1: label-anchored span ──
     label_idx = next((i for i, r in enumerate(ordered)
@@ -623,7 +664,7 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
             if re.search(r"\b\d{6}\b", t):     # a PIN terminates the address
                 break
         if parts:
-            results.append(_assemble_address(parts, confs, aadhaar_num))
+            results.append((_assemble_address(parts, confs, aadhaar_num), True))
 
     # ── strategy 2: marker-based clusters ──
     candidates: List[Dict] = []
@@ -646,15 +687,28 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         best = max(clusters, key=lambda cl: (
             sum(_is_aadhaar_addr_line(x["text"]) for x in cl), len(cl)))
         best.sort(key=lambda r: r["region"].bbox[1])
-        results.append(_assemble_address([r["text"].strip() for r in best],
-                                         [r["conf"] for r in best], aadhaar_num))
+        results.append((_assemble_address([r["text"].strip() for r in best],
+                                          [r["conf"] for r in best],
+                                          aadhaar_num), False))
 
     if not results:
         return "", 0.0, "", "", "father", {}
 
-    # Prefer the result that captured a PIN (index 2 of the tuple) — a strong
-    # signal of a complete address — then the longest address string.
-    return max(results, key=lambda res: (1 if res[2] else 0, len(res[0])))
+    # Prefer a result that captured a PIN (index 2) — a strong signal of a
+    # complete address — then the label-anchored span, then the longest string.
+    #
+    # The label ranks above length because Aadhaar always prints the regional
+    # block *above* the English one, so the label-anchored walk starts below the
+    # regional lines and cannot pick them up — whatever the script, and without
+    # having to recognise the transliterated junk as junk. The marker path is
+    # the one that merges both blocks (they share an x-column) and so wins on
+    # raw length while carrying that junk. It still rescues the case the length
+    # tiebreak was written for: a card whose label was missed, or landed on a
+    # bad panel of a multi-panel e-card — there the label span has no PIN, or
+    # does not exist, and the marker path outranks it as before.
+    best, _ = max(results, key=lambda r: (1 if r[0][2] else 0, r[1],
+                                          len(r[0][0])))
+    return best
 
 
 # Cards print the district label as 'DIST' at least as often as 'District'.

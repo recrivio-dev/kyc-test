@@ -362,7 +362,11 @@ def estimate_skew_angle(gray: np.ndarray) -> float:
         return 0.0
 
     angles = []
-    for x1, y1, x2, y2 in lines[:, 0]:
+    # HoughLinesP's return shape varies across OpenCV builds — (N,1,4) on some,
+    # (N,4) on others (e.g. the opencv-python rapidocr floats in). `lines[:,0]`
+    # only works for (N,1,4) and 500s the whole OCR path otherwise; reshape is
+    # shape-agnostic. (Root cause of the July-2026 rollback.)
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
         dx = x2 - x1
         dy = y2 - y1
         if dx == 0:

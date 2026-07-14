@@ -1,10 +1,7 @@
 # Core
 numpy==2.2.6
 Pillow==10.4.0
-# 4.11 returns cv2.HoughLinesP as (N,4); estimate_skew_angle unpacks lines[:,0]
-# assuming (N,1,4) and 500s on the OCR path. 4.13 restores (N,1,4). See the
-# July-2026 rollback: the model-only /healthz let the broken build deploy green.
-opencv-python-headless==4.13.0.92
+opencv-python-headless==4.11.0.86
 pypdfium2==4.30.0
 streamlit==1.48.1
 

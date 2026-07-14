@@ -1,7 +1,16 @@
 # Core
 numpy==2.2.6
 Pillow==10.4.0
+# Two OpenCV wheels coexist by necessity: surya-ocr pins THIS headless build,
+# while rapidocr-onnxruntime depends on the FULL opencv-python (below). They
+# share the `cv2` namespace, so whichever pip installs last wins the import.
 opencv-python-headless==4.11.0.86
+# Pin the full build too. rapidocr only requires opencv-python>=4.5.1.48, so
+# unpinned it floats — it drifted to 5.0.0.93, whose cv2.HoughLinesP returns
+# (N,4) vs the (N,1,4) older builds returned, which 500'd the OCR path
+# (July-2026 rollback). estimate_skew_angle is now shape-agnostic, but pinning
+# makes the build reproducible instead of silently version-drifting each rebuild.
+opencv-python==5.0.0.93
 pypdfium2==4.30.0
 streamlit==1.48.1
 

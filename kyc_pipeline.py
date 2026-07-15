@@ -578,7 +578,8 @@ class DocumentPipeline:
             T = np.eye(3, dtype=float)
         return T, rotated
 
-    async def _preprocess_for_display(self, img: np.ndarray) -> np.ndarray:
+    async def _preprocess_for_display(
+            self, img: np.ndarray, crop: bool = True) -> Tuple[np.ndarray, bool]:
         """Produce the render returned to the caller by /mask-identity:
         the document cropped out of its background, straightened, stood
         upright, and sized for OCR.
@@ -592,14 +593,43 @@ class DocumentPipeline:
 
         Every mask rectangle is computed on this render, so the returned
         masked/unmasked images and `masked_regions` all share its coordinates.
-        """
-        cropped, _dbg = crop_document(img)
+
+        With ``crop=False`` the quad crop/warp is skipped and the full frame is
+        merely straightened and stood upright — the retry path for when the
+        crop amputated the ID strip. Returns ``(work, did_crop)`` so the caller
+        can tell whether a crop actually happened and decide to retry."""
+        if crop:
+            cropped, dbg = crop_document(img)
+            did_crop = bool(dbg.get("cropped"))
+        else:
+            cropped, did_crop = img, False
         # Residual skew (the quad warp already removes rotation; this is a
         # no-op on a straight image, and it rescues the fallback crop path).
         straight, _ = deskew(cropped)
         angle = await self._detect_orientation(straight)
         upright = rotate_image(straight, angle)
-        return resize_for_ocr(upright, max_side=self.settings.work_max_side)
+        work = resize_for_ocr(upright, max_side=self.settings.work_max_side)
+        return work, did_crop
+
+    async def _preprocess_ocr(
+            self, img: np.ndarray, crop: bool = True
+    ) -> Tuple[np.ndarray, bool, int]:
+        """crop → deskew → orient → resize for the OCR-contract path
+        (`process_and_verify`).
+
+        With ``crop=False`` the contour `auto_crop_document` is skipped and the
+        full frame is used — the retry path for when a crop amputated the ID
+        strip. Returns ``(work, did_crop, angle)``."""
+        if crop:
+            base, crop_dbg = auto_crop_document(img)
+            did_crop = bool(crop_dbg.get("cropped"))
+        else:
+            base, did_crop = img, False
+        desk, _ = deskew(base)
+        angle = await self._detect_orientation(desk)
+        work = resize_for_ocr(rotate_image(desk, angle),
+                              max_side=self.settings.work_max_side)
+        return work, did_crop, angle
 
     async def _preprocess_with_transform(self, img: np.ndarray):
         """Run the same crop→deskew→orient→resize chain as process_and_verify,
@@ -695,20 +725,37 @@ class DocumentPipeline:
         # crop → straighten → orient → resize. Both output images ARE this
         # `work` render, so masks drawn on it need no projection back to the
         # original upload.
+        #
+        # Over-crop retry: crop_document can shear off the ID strip on some
+        # photos. Try the cropped render first; if no ID is located AND a crop
+        # actually happened, re-read the full uncropped frame. The unmasked
+        # image is encoded from whichever render won, so a recovered document
+        # is returned cropped-or-full rather than lost.
         img = self.load_document_image(path)
-        work = await self._preprocess_for_display(img)
+
+        async def _attempt(crop: bool) -> Dict:
+            w, did_crop = await self._preprocess_for_display(img, crop=crop)
+            rr = await self._locate_and_read(w)
+            ft = "\n".join(r["text"] for r in rr if r["text"]).upper()
+            ext = self.verify_and_extract(ft, doc_type)
+            return {"work": w, "did_crop": did_crop,
+                    "region_results": rr, "extracted": ext}
+
+        att = await _attempt(crop=True)
+        if att["extracted"] is None and att["did_crop"]:
+            retry = await _attempt(crop=False)
+            if retry["extracted"] is not None:
+                att = retry
+
+        work = att["work"]
+        region_results = att["region_results"]
+        extracted = att["extracted"]
 
         ok, buf = cv2.imencode(".png", work)
         if not ok:
             out.update(message="Failed to encode document image", status=500)
             return out
         out["unmasked_image"] = buf.tobytes()
-
-        region_results = await self._locate_and_read(work)
-        full_text = "\n".join(rr["text"] for rr in region_results
-                              if rr["text"]).upper()
-
-        extracted = self.verify_and_extract(full_text, doc_type)
         out["document_detected"] = extracted is not None
 
         work_rects: List[Tuple] = []
@@ -772,32 +819,55 @@ class DocumentPipeline:
                 "OCR backend unavailable", status=503)
             return result
 
-        # ── preprocess: crop → deskew → orient ──
+        # ── preprocess + read + classify + extract, with an over-crop retry ──
+        # The contour crop can amputate the ID strip on some real photos. Run
+        # the normal cropped path first (unchanged for the working majority);
+        # if it yields nothing usable AND a crop actually happened, re-read the
+        # full uncropped frame before giving up. If neither finds the ID we
+        # still fail — the retry only ever rescues an over-crop, never masks a
+        # genuinely unreadable document.
         img = self.load_document_image(path)
-        cropped, _ = auto_crop_document(img)
-        desk, _ = deskew(cropped)
-        angle = await self._detect_orientation(desk)
-        work = resize_for_ocr(rotate_image(desk, angle),
-                              max_side=self.settings.work_max_side)
 
-        # ── Stage 1 + 2 + 3: locate, cropped/fused OCR, selective fallback ──
-        region_results = await self._locate_and_read(work)
+        async def _attempt(crop: bool) -> Dict:
+            work, did_crop, angle = await self._preprocess_ocr(img, crop=crop)
+            rr = await self._locate_and_read(work)
+            ft = "\n".join(r["text"] for r in rr if r["text"]).upper()
+            act = self.classify_document(ft)
+            ext = (self.verify_and_extract(ft, act)
+                   if act == intended else None)
+            return {"work": work, "did_crop": did_crop, "angle": angle,
+                    "region_results": rr, "full_text": ft,
+                    "actual": act, "extracted": ext}
 
-        full_text = "\n".join(rr["text"] for rr in region_results
-                              if rr["text"]).upper()
+        att = await _attempt(crop=True)
+        retried = False
+        if att["extracted"] is None and att["did_crop"]:
+            retried = True
+            retry = await _attempt(crop=False)
+            # Keep the uncropped read only when it actually recovered the ID.
+            if retry["extracted"] is not None:
+                att = retry
+
+        work = att["work"]
+        region_results = att["region_results"]
+        full_text = att["full_text"]
+        actual = att["actual"]
+        angle = att["angle"]
         confs = [rr["conf"] for rr in region_results if rr["conf"] > 0]
         used_surya = any(rr["engine"] == "surya" for rr in region_results)
 
-        actual = self.classify_document(full_text)
         result.update({
             "actual_type": actual,
             "extracted_text": full_text,
             "ocr_avg_confidence": (sum(confs) / len(confs)) if confs else None,
             "ocr_decision_reason": (
                 f"located {len(region_results)} regions; "
-                f"surya_fallback={'yes' if used_surya else 'no'}"),
+                f"surya_fallback={'yes' if used_surya else 'no'}; "
+                f"retry_uncropped={'yes' if retried else 'no'}"),
             "ocr_engine": "rapidocr+surya" if used_surya else "rapidocr",
-            "ocr_debug": {"angle": angle, "regions": len(region_results)},
+            "ocr_debug": {"angle": angle, "regions": len(region_results),
+                          "retry_uncropped": retried,
+                          "used_crop": att["did_crop"]},
         })
 
         if actual != intended:
@@ -806,7 +876,7 @@ class DocumentPipeline:
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
-        extracted = self.verify_and_extract(full_text, actual)
+        extracted = att["extracted"]
         if not extracted:
             result["message"] = "ID extraction failed"
             result["output_json"] = failure_envelope(result["message"])

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -525,6 +526,68 @@ _ADDR_LABEL_RX = re.compile(r"A[D0O]{1,2}R[A-Z]*S{1,2}|पता", re.I)
 _ADDR_FOOTER_RX = re.compile(
     r"VID[:\s]|MOBILE|UIDAI|WWW\.|HELP@|@|ENROL|\b1947\b|GOV\.?\s*IN", re.I)
 
+_VOWELS = frozenset("AEIOUY")
+
+# A segment that is nothing but a printed label. OCR sometimes splits the label
+# off its value into its own region ('VTC:' | 'Chandigarh'), and such a line has
+# no readable word by design — it must survive the garbage filter or the value
+# it introduces loses its label.
+_LABEL_ONLY_RX = re.compile(
+    r"^[\s:.,\-]*(?:C/O|S/O|D/O|W/O|VTC|P\.?\s*O|SUB\s*DIST(?:RICT)?|"
+    r"DIST(?:RICT)?|PIN\s*CODE|PIN|STATE|HOUSE\s*NO|H\.?\s*NO)[\s:.,\-]*$",
+    re.I)
+
+
+def _is_plausible_word(w: str) -> bool:
+    """Could the English address block have printed this word?
+
+    Split camelCase first: OCR routinely welds two real words into one token
+    ('UtarPradesh'), and judging the weld as a single word would condemn a
+    perfectly good line. A real word is three-plus letters with a vowel.
+    """
+    for sub in re.split(r"(?<=[a-z])(?=[A-Z])", w):
+        if len(sub) >= 3 and set(sub.upper()) & _VOWELS:
+            return True
+    return False
+
+
+def _is_script_garbage(t: str) -> bool:
+    """True for a line the Latin recogniser hallucinated out of an Indic script.
+
+    Aadhaar prints its address twice — once in the holder's regional language,
+    once in English — and the recogniser carries only ch/en models. The regional
+    block is therefore not rejected but *transliterated* into look-alike Latin
+    at a confidence well above the score gate, differently per script:
+
+        Gujarati   'સરનામું'            -> 'HeHly'
+        Devanagari 'S/O: ईश्वरलाल, डी-404' -> 'S/O: aaR, -404, 3Tq at'
+        Tamil      'S/O: ஈஸ்வரலால்…'      -> 'S/O:下6, -404, 6T6,'
+        Kannada    'S/O: ಈಶ್ವರಲಾಲ್…'      -> 'S/O:α，-404，0'
+
+    These land in the same x-column as the English lines and carry the same
+    S/O marker and the same PIN, so they join the address cluster and feed the
+    care-of name ahead of the English text. Two script-agnostic signals:
+
+      * foreign letters — the ch/en recogniser reaches for CJK and Greek glyphs
+        ('中', 'α', 'の') that English print never contains. Letters only:
+        stray full-width punctuation ('（') does occur in genuine lines.
+      * no readable word — whatever Latin it did emit forms no real word. Only
+        condemn on this when the line would otherwise matter: it carries an
+        address marker (so it would join the cluster), or it holds enough
+        letters that their emptiness is not just a short numeric fragment.
+
+    A line with no letters at all ('395017', 'D-404') is left for the caller to
+    judge — it may be a genuine bare PIN or house number.
+    """
+    if any(ord(c) > 127 and unicodedata.category(c).startswith("L") for c in t):
+        return True
+    words = re.findall(r"[A-Za-z]+", t)
+    if not words or any(_is_plausible_word(w) for w in words):
+        return False
+    if _LABEL_ONLY_RX.match(t.strip()):
+        return False
+    return _is_aadhaar_addr_line(t) or len("".join(words)) >= 3
+
 
 def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
@@ -554,7 +617,27 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         d = re.sub(r"\D", "", t)
         return len(d) >= 11 or bool(digits_aadhaar and digits_aadhaar in d)
 
-    results: List[Tuple] = []
+    # Drop the transliterated regional-language block before either strategy
+    # sees it, so both score on the English address alone.
+    ordered = [r for r in ordered if not _is_script_garbage(r["text"])]
+
+    # Some scripts collapse their PIN line to bare digits ('ওয়েস্ট বেঙ্গল - 713205'
+    # -> '-713205'), which is indistinguishable from a genuine bare-PIN line
+    # ('395017') on its own — but it is a *duplicate*: the English block prints
+    # that same PIN next to its state name. Drop a word-less PIN line only when
+    # the PIN is already carried by a line that has words.
+    def _pin_of(text: str) -> str:
+        m = re.search(r"\b(\d{6})\b", text)
+        return m.group(1) if m else ""
+
+    worded_pins = {_pin_of(r["text"]) for r in ordered
+                   if re.search(r"[A-Za-z]{3,}", r["text"])} - {""}
+    ordered = [r for r in ordered
+               if re.search(r"[A-Za-z]{3,}", r["text"])
+               or _pin_of(r["text"]) not in worded_pins]
+
+    # (assembled_result, came_from_the_label_anchored_span)
+    results: List[Tuple[Tuple, bool]] = []
 
     # ── strategy 1: label-anchored span ──
     label_idx = next((i for i, r in enumerate(ordered)
@@ -581,7 +664,7 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
             if re.search(r"\b\d{6}\b", t):     # a PIN terminates the address
                 break
         if parts:
-            results.append(_assemble_address(parts, confs, aadhaar_num))
+            results.append((_assemble_address(parts, confs, aadhaar_num), True))
 
     # ── strategy 2: marker-based clusters ──
     candidates: List[Dict] = []
@@ -604,15 +687,63 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         best = max(clusters, key=lambda cl: (
             sum(_is_aadhaar_addr_line(x["text"]) for x in cl), len(cl)))
         best.sort(key=lambda r: r["region"].bbox[1])
-        results.append(_assemble_address([r["text"].strip() for r in best],
-                                         [r["conf"] for r in best], aadhaar_num))
+        results.append((_assemble_address([r["text"].strip() for r in best],
+                                          [r["conf"] for r in best],
+                                          aadhaar_num), False))
 
     if not results:
         return "", 0.0, "", "", "father", {}
 
-    # Prefer the result that captured a PIN (index 2 of the tuple) — a strong
-    # signal of a complete address — then the longest address string.
-    return max(results, key=lambda res: (1 if res[2] else 0, len(res[0])))
+    # Prefer a result that captured a PIN (index 2) — a strong signal of a
+    # complete address — then the label-anchored span, then the longest string.
+    #
+    # The label ranks above length because Aadhaar always prints the regional
+    # block *above* the English one, so the label-anchored walk starts below the
+    # regional lines and cannot pick them up — whatever the script, and without
+    # having to recognise the transliterated junk as junk. The marker path is
+    # the one that merges both blocks (they share an x-column) and so wins on
+    # raw length while carrying that junk. It still rescues the case the length
+    # tiebreak was written for: a card whose label was missed, or landed on a
+    # bad panel of a multi-panel e-card — there the label span has no PIN, or
+    # does not exist, and the marker path outranks it as before.
+    best, _ = max(results, key=lambda r: (1 if r[0][2] else 0, r[1],
+                                          len(r[0][0])))
+    return best
+
+
+# Cards print the district label as 'DIST' at least as often as 'District'.
+# 'Sub District' is a different administrative level and must never fill it.
+_DIST_LABEL_RX = re.compile(r"\bDIST(?:RICT)?\b", re.I)
+_SUBDIST_RX = re.compile(r"\bSUB[\s.-]*DIST(?:RICT)?\b", re.I)
+_VTC_LABEL_RX = re.compile(r"\bVTC\b", re.I)
+_CITY_SUFFIX_RX = re.compile(r"^(.+?)\s+CITY$", re.I)
+# A place name: letters only. Rejects a wrapped-past-the-label segment that is
+# really the PIN line ('Gujarat - 382330') or a house number.
+_PLACE_RX = re.compile(r"^[A-Za-z][A-Za-z\s.]{1,40}$")
+
+
+def _labelled_place(segments: List[str], label_rx: re.Pattern,
+                    skip_rx: re.Pattern | None = None) -> str:
+    """Value printed against a label, across the UIDAI line wrap.
+
+    The English block wraps mid-label, so the label routinely ends its printed
+    line and the value opens the next one — joined here as two comma segments
+    ('… , PO: Nana Chiloda, DIST:, Ahmedabad, …'). Matching label-then-value
+    within one segment misses that entirely, so fall through to the following
+    segment whenever the label's own segment carries no value.
+    """
+    for i, seg in enumerate(segments):
+        if skip_rx is not None and skip_rx.search(seg):
+            continue
+        m = label_rx.search(seg)
+        if not m:
+            continue
+        val = seg[m.end():].strip(" .:-")
+        if not val and i + 1 < len(segments):
+            val = segments[i + 1].strip(" .:-")
+        if _PLACE_RX.match(val):
+            return _clean_name(val)
+    return ""
 
 
 def _assemble_address(parts: List[str], confs: List[float],
@@ -667,19 +798,26 @@ def _assemble_address(parts: List[str], confs: List[float],
         components["house_number"] = re.sub(r"^[A-Za-z]-?", "", hn.group(1))
 
     # District / city from their labelled segments where present.
-    dm = re.search(r"\bDISTRICT[.:\s]+([A-Za-z][A-Za-z\s]*?)\s*[,;]",
-                   full, re.I)
-    if dm:
-        components["district"] = _clean_name(dm.group(1))
-    vm = re.search(r"\bVTC[.:\s]*([A-Za-z][A-Za-z\s]*?)\s*[,;]", full, re.I)
-    if vm:
-        components["city"] = _clean_name(vm.group(1))
+    segments = [s for s in re.split(r"\s*,\s*", full) if s.strip()]
+    components["district"] = _labelled_place(
+        segments, _DIST_LABEL_RX, skip_rx=_SUBDIST_RX)
+    components["city"] = _labelled_place(segments, _VTC_LABEL_RX)
+    if not components["city"]:
+        # Backs that carry no VTC label print the town as its own segment,
+        # 'Ahmedabad City'. Anchored at both ends so a road name ('Nr City
+        # Light Road') can never be mistaken for the city.
+        for seg in segments:
+            m = _CITY_SUFFIX_RX.match(seg.strip())
+            if m and _PLACE_RX.match(m.group(1)):
+                components["city"] = _clean_name(m.group(1))
+                break
 
     # NOTE: city / district are filled ONLY from their explicit labels (VTC /
-    # District). The old "guess the last two comma tokens" heuristic is gone —
-    # on a garbled address it produced confidently-wrong values (city="Avenue")
-    # and a wrong structured field is worse than an empty one. The full address
-    # string is always returned; downstream can re-parse if it needs more.
+    # District / 'X City'). The old "guess the last two comma tokens" heuristic
+    # is gone — on a garbled address it produced confidently-wrong values
+    # (city="Avenue") and a wrong structured field is worse than an empty one.
+    # The full address string is always returned; downstream can re-parse if it
+    # needs more.
 
     conf = sum(confs) / len(confs) if confs else 0.0
     return full, conf, pin, care_of, care_of_relation, components

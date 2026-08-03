@@ -30,6 +30,21 @@ surya-ocr==0.17.0
 torch==2.8.0
 torchvision==0.23.0
 
+# Liveness / face-match — MediaPipe FaceLandmarker + InsightFace ArcFace, both
+# CPU/ONNX. Newer than live-mini's pins (mediapipe 0.10.14 / insightface 0.7.3)
+# because those predate numpy 2 and would force a numpy/opencv downgrade that
+# breaks the OCR path. These two resolve additively against numpy 2.2.6,
+# opencv 4.13, onnxruntime 1.22.1.
+mediapipe==1.0.0
+insightface==1.0.1
+# mediapipe hard-depends on opencv-contrib-python. None of the ported liveness
+# code calls a contrib API — every cv2.* call is core — but pip installs it
+# regardless, and it lands in the SAME `cv2` namespace as the two wheels above.
+# Left unpinned it floats to whatever is latest, which is exactly the drift that
+# broke the OCR path in July 2026. Pinned to match opencv-python==5.0.0.93 so
+# the cv2 API is identical whichever wheel wins the import race.
+opencv-contrib-python==5.0.0.93
+
 # Utils
 scipy
 pandas

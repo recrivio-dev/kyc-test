@@ -44,6 +44,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/cache/huggingface \
     TRANSFORMERS_CACHE=/cache/huggingface \
     TORCH_HOME=/cache/torch \
+    # Liveness face models (MediaPipe + InsightFace) — same reasoning, a
+    # separate cache dir so the volume can be sized/wiped independently.
+    LIVENESS_MODELS_DIR=/cache/liveness \
     # ONNX & BLAS threading: one thread per worker, gunicorn fans out via
     # multiple workers instead. Prevents thread storms on 2 vCPU.
     OMP_NUM_THREADS=1 \
@@ -77,8 +80,14 @@ WORKDIR /app
 COPY --chown=app:app api.py config.py kyc_pipeline.py layout_detector.py \
                      ocr_engines.py output_schema.py preprocessing.py \
                      gunicorn_conf.py /app/
+# The COPY above is an explicit file list, so a new package must be named here
+# or it silently never reaches the image.
+COPY --chown=app:app liveness/ /app/liveness/
 
-RUN mkdir -p /cache/huggingface /cache/torch /app/sample-docs \
+# /cache/liveness holds the runtime-fetched face models (~330 MB extracted:
+# MediaPipe .task/.tflite + the InsightFace buffalo_l pack). Mounted as a
+# volume so a container restart doesn't re-pull them.
+RUN mkdir -p /cache/huggingface /cache/torch /cache/liveness /app/sample-docs \
  && chown -R app:app /cache /app/sample-docs
 
 USER app

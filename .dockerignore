@@ -18,10 +18,14 @@ env
 sample
 sample-docs
 models
+# Liveness weights are fetched at runtime onto the /cache/liveness volume;
+# a local dev copy must never be baked into the image (~330 MB).
+liveness_models
 
 # Streamlit + CLI not used in the API container.
 app.py
 main.py
+liveness_app.py
 test_ocr.py
 postman.md
 README.md

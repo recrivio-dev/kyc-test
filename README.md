@@ -22,8 +22,8 @@ contract, and produces a redacted image.
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. FastAPI service (for frontends)
-uvicorn api:app --reload --port 8000
+# 2. FastAPI service (for frontends) — ONE process serves OCR, masking AND liveness
+LIVENESS_MODELS_DIR=./liveness_models uvicorn api:app --reload --port 8000
 
 # 3. Streamlit UI (visual sanity check + JSON viewer)
 streamlit run app.py
@@ -31,6 +31,31 @@ streamlit run app.py
 # 4. CLI (interactive, mostly for local testing)
 python main.py
 ```
+
+That single `uvicorn api:app` is the whole backend — there is no second
+service to start. The OCR/masking routes (`/api/v1/ocr/...`) and the
+face liveness + ID-match routes (`/api/v1/liveness/...`, see
+[docs/liveness-api.md](docs/liveness-api.md)) share one app, one port and
+one process.
+
+`LIVENESS_MODELS_DIR` is a **local-dev override only**. It defaults to
+`/cache/liveness`, which is the in-container path baked into the
+[Dockerfile](Dockerfile) and [docker-compose.yml](docker-compose.yml) — so
+under Docker a plain `uvicorn api:app` is enough. Outside Docker that path
+doesn't exist, so point it at the repo-local weights directory.
+
+Wait for readiness before firing the first request — the OCR models load
+and a startup self-test drives a document through the whole pipeline, so
+`ok` only turns `true` once the service can actually serve:
+
+```bash
+curl -s http://127.0.0.1:8000/healthz | jq
+# {"ok": true, "selftest_ok": true, "liveness_ready": true, ...}
+```
+
+`liveness_ready` is reported separately and stays `false` while the ~330 MB
+of face weights download in the background on a cold cache; the OCR routes
+serve normally throughout.
 
 Smoke-test the HTTP endpoint:
 
@@ -174,8 +199,12 @@ ocr-all-classifier/
 ### FastAPI service
 
 ```bash
-uvicorn api:app --reload --port 8000
+LIVENESS_MODELS_DIR=./liveness_models uvicorn api:app --reload --port 8000
 ```
+
+One process, one port, both subsystems. Drop the env var under Docker (it
+is already set in the image). Full interactive docs at
+`http://127.0.0.1:8000/docs`.
 
 Endpoints:
 

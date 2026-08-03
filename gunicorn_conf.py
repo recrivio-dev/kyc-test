@@ -8,6 +8,11 @@ Tuned for a 2 vCPU / 4 GB host (e.g. AWS t3.medium):
 
 If KYC_ENABLE_SURYA=true, each worker grows by ~1.5-2 GB after the first
 low-confidence crop. On a 4 GB host you MUST drop to WEB_CONCURRENCY=1.
+
+The liveness endpoints add a MediaPipe graph + InsightFace ONNX sessions per
+worker on top of the OCR models, once that worker serves its first liveness
+request. See docker-compose.yml for the measured cost and the concurrency
+trade-off.
 """
 from __future__ import annotations
 
@@ -33,7 +38,9 @@ worker_class = "uvicorn.workers.UvicornWorker"
 threads = 1
 
 # ONNX models load on first request per worker; don't preload via fork
-# (onnxruntime sessions don't survive fork cleanly on Linux).
+# (onnxruntime sessions don't survive fork cleanly on Linux). This now covers
+# the liveness InsightFace sessions too — they are onnxruntime sessions with
+# the same fork-safety problem, so preload_app must stay False.
 preload_app = False
 
 timeout = _int_env("GUNICORN_TIMEOUT", 120)

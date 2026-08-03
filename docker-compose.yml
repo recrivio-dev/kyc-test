@@ -13,15 +13,33 @@ services:
       # Flip to "true" only after pinning surya-ocr / transformers versions
       # AND dropping WEB_CONCURRENCY to 1 (Surya ~+2 GB resident per worker).
       KYC_ENABLE_SURYA: "false"
+      # Liveness costs ~130 MB on top of a hot OCR worker (measured A/B on the
+      # peak-RSS high-water mark: 967 MB OCR-only vs 1096 MB with the MediaPipe
+      # graph + InsightFace ONNX sessions also loaded). That is well under the
+      # 400-600 MB a full buffalo_l pack would cost, because face_engine trims
+      # the pack to detection + recognition + landmark_2d_106. Two hot workers
+      # land near 2.2 GB against the 3 GB cap — it fits, with less headroom than
+      # OCR alone. Drop to "1" if you also flip KYC_ENABLE_SURYA on.
       WEB_CONCURRENCY: "2"
       GUNICORN_TIMEOUT: "120"
       GUNICORN_LOG_LEVEL: "info"
+      LIVENESS_MODELS_DIR: "/cache/liveness"
+      # Liveness weights download in the background after boot, so `ok` in
+      # /healthz gates on OCR only by default. Flip to "true" on a deployment
+      # that must not receive traffic until liveness can actually serve.
+      LIVENESS_REQUIRED: "false"
 
     volumes:
       # Persist Surya/HF model downloads so we don't re-pull ~1.34 GB on
       # every restart. Cheap insurance even with Surya off today.
       - hf_cache:/cache/huggingface
       - torch_cache:/cache/torch
+      # Liveness face models: 329 MB steady state (MediaPipe .task/.tflite plus
+      # the extracted InsightFace buffalo_l pack), peaking near 605 MB during
+      # first provisioning while the 275 MB source archive still coexists with
+      # its extracted contents. Size this volume for ~700 MB. Persisted so a
+      # restart doesn't re-pull ~290 MB.
+      - liveness_models:/cache/liveness
       # Masked output images (optional — comment out if you don't need them
       # on disk; the API doesn't serve them).
       - ./sample-docs:/app/sample-docs
@@ -55,3 +73,4 @@ services:
 volumes:
   hf_cache:
   torch_cache:
+  liveness_models:

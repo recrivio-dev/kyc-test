@@ -18,6 +18,10 @@ sample-docs/
 sample/
 sample-specifics/
 
+# Liveness model cache for local dev (LIVENESS_MODELS_DIR=./liveness_models).
+# ~330 MB of weights, fetched at runtime — never committed.
+liveness_models/
+
 # Backups & logs
 *.bak
 *.log

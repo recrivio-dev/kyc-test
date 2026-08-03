@@ -18,9 +18,15 @@ Per-document-type endpoints (no ``doc_type`` form field needed):
 
 The response body is exactly the contract documented in
 ``output_schema.py`` — i.e. the same JSON that the Streamlit UI displays.
+
+Face liveness + ID-photo face-match ship in the same process under
+``/api/v1/liveness/...`` (see ``liveness/router.py``). They deliberately return
+their own schemas rather than the OCR ``success_envelope``; the two subsystems
+share a container, not a response contract.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -34,6 +40,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from kyc_pipeline import DocumentPipeline
+from liveness.router import models_on_disk
+from liveness.router import router as liveness_router
 from output_schema import failure_envelope, success_envelope
 
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
@@ -59,6 +67,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(liveness_router)
+
 # One pipeline instance for the process lifetime — the OCR models load once.
 _pipeline = DocumentPipeline()
 
@@ -70,6 +80,51 @@ _pipeline = DocumentPipeline()
 # becomes healthy — the container is caught at deploy time, not by users.
 _selftest_ok = False
 _selftest_error: "str | None" = None
+
+# Liveness readiness is tracked and reported SEPARATELY from the OCR self-test.
+# The two subsystems share a process but not a failure mode: an OCR-only deploy
+# must not go unhealthy merely because the ~330 MB of liveness weights are still
+# downloading onto a cold cache volume. By default `/healthz` therefore gates
+# `ok` on OCR alone; set LIVENESS_REQUIRED=true on a deployment that genuinely
+# serves liveness traffic and wants the probe to fail until it can.
+_liveness_ready = False
+_liveness_error: "str | None" = None
+_LIVENESS_REQUIRED = os.getenv(
+    "LIVENESS_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _provision_liveness() -> None:
+    """Download the liveness weights and prove they infer, in the background.
+
+    Runs OFF the startup path on purpose. The first cold-volume download is
+    ~330 MB, which would blow past the 60 s `start_period` in the compose
+    healthcheck and flap the container. Until it finishes, `/healthz` reports
+    `liveness_ready: false` and the liveness endpoints load lazily anyway (each
+    would just pay the download cost on first call).
+    """
+    global _liveness_ready, _liveness_error
+
+    def _work() -> None:
+        from liveness.utils.face_engine import detect_faces, detect_landmarks
+        from liveness.utils.model_manager import ensure_all_models
+
+        ensure_all_models()
+        # Readiness is not "files exist" — it's "the graphs actually run". One
+        # synthetic frame through both engines catches a corrupt download or an
+        # ONNX/mediapipe API break that a stat() check would sail past.
+        probe = np.full((256, 256, 3), 127, np.uint8)
+        detect_landmarks(probe)
+        detect_faces(probe)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _work)
+        _liveness_ready, _liveness_error = True, None
+        logging.getLogger("uvicorn.error").info("Liveness models provisioned and verified.")
+    except Exception as exc:  # any failure ⇒ liveness not ready
+        _liveness_ready = False
+        _liveness_error = f"{type(exc).__name__}: {exc}"
+        logging.getLogger("uvicorn.error").error(
+            "Liveness provisioning FAILED: %s", _liveness_error)
 
 
 def _selftest_image() -> "np.ndarray":
@@ -114,19 +169,34 @@ async def _warmup() -> None:
         except OSError:
             pass
 
+    # Fire-and-forget: liveness provisions in the background so a cold cache
+    # volume never delays the container becoming healthy. See _provision_liveness.
+    asyncio.create_task(_provision_liveness())
+
 
 @app.get("/healthz")
 def healthz():
     # 200 only when models are loaded AND the pipeline self-test passed, so a
     # boots-but-crashes build never reports healthy. 503 flips the Docker
     # healthcheck (and any load balancer) to unhealthy.
-    ok = bool(_pipeline.ocr_available and _selftest_ok)
+    #
+    # Liveness is reported alongside but does not gate `ok` unless
+    # LIVENESS_REQUIRED is set — the subsystems are independently deployable and
+    # liveness weights arrive after boot.
+    ocr_ok = bool(_pipeline.ocr_available and _selftest_ok)
+    ok = ocr_ok and (_liveness_ready or not _LIVENESS_REQUIRED)
     return JSONResponse(
         content={
             "ok": ok,
             "ocr_available": _pipeline.ocr_available,
             "selftest_ok": _selftest_ok,
             "selftest_error": _selftest_error,
+            # True once the weights are on disk AND a synthetic frame ran
+            # through the MediaPipe + InsightFace graphs without raising.
+            "liveness_ready": _liveness_ready,
+            "liveness_error": _liveness_error,
+            "liveness_required": _LIVENESS_REQUIRED,
+            "liveness_models": models_on_disk(),
         },
         status_code=200 if ok else 503,
     )

@@ -491,7 +491,7 @@ Stage weights: `0.10·position + 0.10·lighting + 0.25·blink + 0.25·challenge 
 Failures return a FastAPI error body, **not** the OCR envelope:
 
 ```json
-{"detail": "Too many frames: 91 (max 90)."}
+{"detail": "Too many frames: 161 (max 160)."}
 ```
 
 `422` returns `detail` as an **array** of pydantic validation errors instead of a string.
@@ -500,7 +500,7 @@ Failures return a FastAPI error body, **not** the OCR envelope:
 |---|---|---|
 | `400` | No frames supplied | `Provide at least one base64 frame in 'frames'.` |
 | `400` | Multipart with neither part | `Provide either a 'video' file or one or more 'frames' image files.` |
-| `400` | Over the frame cap | `Too many frames: 91 (max 90).` |
+| `400` | Over the frame cap | `Too many frames: 161 (max 160).` |
 | `400` | Not valid base64 | `Invalid frame[0]: not valid base64 (...)` |
 | `400` | Decodes, but isn't an image | `Invalid frame[0]: Could not decode image bytes (unsupported format?)` |
 | `400` | Undecodable video | `Invalid video: No frames decoded from video` |
@@ -515,7 +515,7 @@ Failures return a FastAPI error body, **not** the OCR envelope:
 
 | Limit | Default | Env override |
 |---|---|---|
-| Frames per request | 90 | `LIVENESS_MAX_JSON_FRAMES` |
+| Frames per request | 160 | `LIVENESS_MAX_JSON_FRAMES` |
 | Decoded payload bytes | 25165824 (24 MiB) | `LIVENESS_MAX_JSON_BYTES` |
 | Request timeout | 120 s | `GUNICORN_TIMEOUT` |
 
@@ -670,7 +670,7 @@ Typical latencies on 2 vCPU, models warm: `/identity` ~2.5 s, `/frames` (20 fram
 |---|---|---|
 | `LIVENESS_MODELS_DIR` | `/cache/liveness` | Where weights are cached. Local dev: `./liveness_models` |
 | `LIVENESS_REQUIRED` | `false` | Fold `liveness_ready` into `/healthz`'s `ok` |
-| `LIVENESS_MAX_JSON_FRAMES` | `90` | Frame-count cap on the JSON endpoints |
+| `LIVENESS_MAX_JSON_FRAMES` | `160` | Frame-count cap on the JSON endpoints. Raising it also raises `layer3_liveness.MAX_FRAMES_SEQUENCE`, which is derived from it |
 | `LIVENESS_MAX_JSON_BYTES` | `25165824` | Decoded-payload cap (413 above it) |
 | `LIVENESS_INSIGHTFACE_MODEL` | `buffalo_l` | InsightFace pack name |
 | `LIVENESS_DET_SIZE` | `640` | Detector input size |

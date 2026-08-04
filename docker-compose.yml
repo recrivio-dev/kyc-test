@@ -24,6 +24,21 @@ services:
       GUNICORN_TIMEOUT: "120"
       GUNICORN_LOG_LEVEL: "info"
       LIVENESS_MODELS_DIR: "/cache/liveness"
+      # Raised from the 90 default. That number was inherited from the
+      # multipart/video path's read_frames ceiling and is not what actually
+      # bounds /verify-json — max_json_bytes (24 MiB decoded) is, and a real
+      # 88-frame capture measured 2.7-3.3 MB, so 90 frames was throttling the
+      # take at a quarter of the byte budget.
+      #
+      # The caller needs that room to give candidates a workable cue: 2 s per
+      # challenge did not cover reading the prompt AND completing the movement.
+      # At 160 the client's 3 x 3500 ms sequence lands near 140 frames and
+      # ~6 MB decoded, still a quarter of the byte cap.
+      #
+      # Cost is inference time, linear in frames: 88 frames measured 2.8-4.0 s
+      # end to end, so 160 lands near 5-7 s — inside GUNICORN_TIMEOUT above.
+      # Raise this BEFORE the matching cap in recriauth, or valid bursts 413.
+      LIVENESS_MAX_JSON_FRAMES: "160"
       # Liveness weights download in the background after boot, so `ok` in
       # /healthz gates on OCR only by default. Flip to "true" on a deployment
       # that must not receive traffic until liveness can actually serve.

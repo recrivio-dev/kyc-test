@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from liveness.config import settings
 from liveness.schemas.requests import ChallengeType
 from liveness.schemas.responses import ChallengeStepResult, LivenessResult, Reason
 from liveness.services import reason_codes as rc
@@ -58,10 +59,29 @@ MICRO_POINTS = [33, 263, 1, 61, 291]
 #     ~5 fps, and a blink lasts 100-300 ms — it would routinely fall BETWEEN
 #     sampled frames and read as "no blink" for a candidate who blinked properly.
 #
-# So a sequence keeps the full server-side input cap. The extra ~30 landmark
-# passes cost a few hundred ms; a false "no blink" costs a real candidate a retry.
+# So a sequence keeps the full server-side input cap. The extra landmark passes
+# cost a few hundred ms; a false "no blink" costs a real candidate a retry.
+#
+# MAX_FRAMES_SEQUENCE is DERIVED from ``settings.max_json_frames`` rather than
+# written down, because LIVENESS_MAX_JSON_FRAMES is env-overridable and a
+# hard-coded twin drifts the first time someone raises it in a deployment. It
+# is not an independent tuning knob — two things break the moment it sits below
+# the transport cap:
+#
+#   1. Blink loss, the failure this ceiling exists to prevent. Thinning a
+#      ~12 s take down to 90 frames is ~7.5 fps, and at 100-300 ms a blink
+#      occupies 0.8-2.3 frames — right on the edge of vanishing between
+#      samples. Raising the transport cap WITHOUT raising this one is worse
+#      than not raising it at all: more frames arrive, then get thinned harder.
+#   2. ``peak_frame_index`` desync. Peaks are reported as indices into the
+#      sampled list. Callers compare them against cue windows expressed in the
+#      indices they SENT, so any sub-sampling here silently shifts every peak
+#      and makes "landed when asked" read wrong.
+#
+# Both are avoided by tracking the transport cap exactly, so sub-sampling can
+# never fire on a sequence: nothing larger than it can arrive.
 MAX_FRAMES = 60
-MAX_FRAMES_SEQUENCE = 90
+MAX_FRAMES_SEQUENCE = settings.max_json_frames
 
 
 def _interocular(lm: np.ndarray) -> float:

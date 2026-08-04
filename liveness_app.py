@@ -109,9 +109,14 @@ def _even_sample_indices(total: int, keep: int) -> list[int]:
     return sorted(set(int(i) for i in idx))
 
 
-# The service caps a JSON burst at 90 frames AND 24 MiB of decoded payload
-# (LIVENESS_MAX_JSON_FRAMES / LIVENESS_MAX_JSON_BYTES). Frame count alone is not
-# enough: 90 raw 1280x720 webcam JPEGs are ~27 MB and get a 413.
+# The service caps a JSON burst at FRAME_COUNT_CAP frames AND 24 MiB of decoded
+# payload (LIVENESS_MAX_JSON_FRAMES / LIVENESS_MAX_JSON_BYTES). Frame count
+# alone is not enough: 160 raw 1280x720 webcam JPEGs are ~48 MB and get a 413.
+#
+# Held as a literal rather than imported from liveness.config: this harness is
+# deliberately a pure HTTP client so it can be pointed at a deployed service
+# without the package on the path. Keep it in step by hand.
+FRAME_COUNT_CAP = 160
 #
 # Downscaling costs nothing that matters here. InsightFace detects at 640x640 and
 # MediaPipe landmarks are computed on a normalised crop, so pixels beyond ~720 on
@@ -152,8 +157,8 @@ def _encode_frames(
         return out
 
     # Frame count first — it is a hard server limit, not a budget.
-    if len(raw) > 90:
-        idx = _even_sample_indices(len(raw), 90)
+    if len(raw) > FRAME_COUNT_CAP:
+        idx = _even_sample_indices(len(raw), FRAME_COUNT_CAP)
         raw = [raw[i] for i in idx]
         stamps = [stamps[i] for i in idx]
 
@@ -253,14 +258,28 @@ def record_webcam(
 # exists so the service has clean frontal frames to pick an identity probe from
 # (it selects the sharpest frame containing a face itself).
 #
-# Durations are deliberate: the whole take must stay inside the 90-frame server
-# cap while leaving enough temporal resolution for a 100-300 ms blink. ~9 s at
-# ~10 fps hits both.
+# Durations MUST mirror recriauth's capture hook (use-liveness-capture.ts).
+# This harness is what the motion thresholds get calibrated against, so a
+# sequence that is paced differently from the one candidates actually perform
+# calibrates against a take nobody makes.
+#
+# 2.0 s per cue was too short in practice — that budget has to cover reading
+# the prompt AND completing the movement, so a candidate who reacts at all
+# slowly peaks after the cue closes or never moves far enough to clear the
+# excursion threshold. 3.5 s, inside a FRAME_COUNT_CAP raised to 160.
+#
+# The 0.6 s "look straight ahead" beats between challenges are load-bearing,
+# not padding: _challenge_stage takes its excursion baseline as the MEDIAN pose
+# over the whole clip, so a candidate who holds each turn drags that median
+# toward the turn and shrinks their own measured excursion. Returning to centre
+# keeps the median at rest.
 FLOW_PHASES: list[tuple[str | None, float, str]] = [
     (None,         3.0, "Look straight at the camera"),
-    ("turn_left",  2.0, "Turn your head LEFT"),
-    ("turn_right", 2.0, "Turn your head RIGHT"),
-    ("blink",      2.0, "Blink slowly, twice"),
+    ("turn_left",  3.5, "Turn your head LEFT"),
+    (None,         0.6, "Look straight ahead"),
+    ("turn_right", 3.5, "Turn your head RIGHT"),
+    (None,         0.6, "Look straight ahead"),
+    ("blink",      3.5, "Blink slowly, twice"),
 ]
 FLOW_SEQUENCE = [c for c, _, _ in FLOW_PHASES if c]
 MAX_ATTEMPTS = 3

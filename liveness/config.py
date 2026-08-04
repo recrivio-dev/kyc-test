@@ -97,11 +97,21 @@ class LivenessSettings:
     weight_liveness: float = 0.45
 
     # ---- JSON frame-burst limits ----
-    # Mirrors the multipart ``read_frames`` ceiling so both transports behave
-    # identically; the byte cap stops a base64 body from OOM-ing the worker
-    # (base64 inflates ~33%, and 90 frames of 720p JPEG is order-10 MB).
+    # The byte cap stops a base64 body from OOM-ing the worker (base64 inflates
+    # ~33%, and 160 frames of 720p JPEG is order-10 MB decoded).
+    #
+    # The frame cap was 90, inherited from the multipart ``read_frames``
+    # ceiling. That parity was cosmetic and it throttled the JSON path at a
+    # quarter of the byte budget — a measured 88-frame webcam take is only
+    # ~3 MB decoded against 24 MiB. The cost was paid by candidates: a
+    # three-challenge sequence had to fit 90 frames, leaving ~2 s per cue,
+    # which does not cover reading the prompt AND completing the movement.
+    #
+    # Raising this REQUIRES raising ``layer3_liveness.MAX_FRAMES_SEQUENCE`` to
+    # match — see the comment there. Left behind, it silently sub-samples the
+    # extra frames straight back out and shifts every ``peak_frame_index``.
     max_json_frames: int = field(
-        default_factory=lambda: _env_int("LIVENESS_MAX_JSON_FRAMES", 90)
+        default_factory=lambda: _env_int("LIVENESS_MAX_JSON_FRAMES", 160)
     )
     max_json_bytes: int = field(
         default_factory=lambda: _env_int("LIVENESS_MAX_JSON_BYTES", 24 * 1024 * 1024)

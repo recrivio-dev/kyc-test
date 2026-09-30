@@ -1,18 +1,17 @@
+# Runtime dependencies of the FastAPI OCR service (what the Docker image ships).
+# Optional extras: requirements-surya.txt (Surya fallback OCR, off by default)
+# and requirements-dev.txt (Streamlit debug UIs).
+
 # Core
 numpy==2.2.6
 Pillow==10.4.0
-# Two OpenCV wheels coexist by necessity: surya-ocr pins THIS headless build,
-# while rapidocr-onnxruntime depends on the FULL opencv-python (below). They
-# share the `cv2` namespace, so whichever pip installs last wins the import.
-opencv-python-headless==4.11.0.86
-# Pin the full build too. rapidocr only requires opencv-python>=4.5.1.48, so
-# unpinned it floats — it drifted to 5.0.0.93, whose cv2.HoughLinesP returns
-# (N,4) vs the (N,1,4) older builds returned, which 500'd the OCR path
-# (July-2026 rollback). estimate_skew_angle is now shape-agnostic, but pinning
-# makes the build reproducible instead of silently version-drifting each rebuild.
+# rapidocr only requires opencv-python>=4.5.1.48, so unpinned it floats — it
+# drifted to 5.0.0.93, whose cv2.HoughLinesP returns (N,4) vs the (N,1,4)
+# older builds returned, which 500'd the OCR path (July-2026 rollback).
+# estimate_skew_angle is now shape-agnostic, but pinning keeps the build
+# reproducible instead of silently version-drifting each rebuild.
 opencv-python==5.0.0.93
 pypdfium2==4.30.0
-streamlit==1.48.1
 
 # HTTP API
 fastapi==0.118.0
@@ -20,16 +19,6 @@ uvicorn[standard]==0.32.1
 python-multipart==0.0.20
 
 # Primary OCR — PaddleOCR (PP-OCR) models served via ONNX Runtime.
-# No PaddlePaddle, no GPU needed; the ONNX session releases the GIL so
-# asyncio.gather over crops runs concurrently.
+# No PaddlePaddle, no GPU needed.
 rapidocr-onnxruntime==1.4.4
 onnxruntime==1.22.1
-
-# Fallback OCR — invoked only on individual low-confidence crops.
-surya-ocr==0.17.0
-torch==2.8.0
-torchvision==0.23.0
-
-# Utils
-scipy
-pandas

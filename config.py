@@ -16,6 +16,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class OCRSettings:
     primary_lang: str = "en"
@@ -30,6 +37,19 @@ class OCRSettings:
     enable_surya_fallback: bool = field(
         default_factory=lambda: _env_bool("KYC_ENABLE_SURYA", False)
     )
+    # ONNX Runtime intra-op threads per session. 0 = ORT default (one per
+    # physical core). Set to the vCPUs available to ONE worker.
+    threads: int = field(default_factory=lambda: _env_int("KYC_ORT_THREADS", 0))
+    # Longest side the text *detector* sees. Recognition still crops from the
+    # full-resolution work image, so this trades only small-text recall for
+    # speed. 0 = RapidOCR default (detector runs at up to work_max_side).
+    det_max_side: int = field(
+        default_factory=lambda: _env_int("KYC_DET_MAX_SIDE", 0))
+    # Recognition model override. Empty = RapidOCR's bundled ch_PP-OCRv4 rec.
+    rec_model_path: str = field(
+        default_factory=lambda: os.getenv("KYC_REC_MODEL", ""))
+    rec_keys_path: str = field(
+        default_factory=lambda: os.getenv("KYC_REC_KEYS", ""))
 
 
 @dataclass
@@ -41,9 +61,12 @@ class LayoutSettings:
     yolo_model_path: str = "models/layout.onnx"
     yolo_classes: tuple = ("text", "title", "list", "table", "figure")
     score_threshold: float = 0.30
-    # Brute-force 4-angle orientation probe on a downscaled image.
-    # Cheap (detection-only), and far cheaper than the old 4 full OCR passes.
+    # Stand the page upright before the main read. A detection + angle-class
+    # probe decides clear cases; ambiguous ones fall back to the 4-angle
+    # full-OCR probe.
     detect_orientation: bool = True
+    # Longest side of the downscaled copy the orientation probe runs on.
+    orientation_probe_side: int = 960
 
 
 @dataclass
@@ -63,6 +86,11 @@ class Settings:
     layout: LayoutSettings = field(default_factory=LayoutSettings)
     mask: MaskSettings = field(default_factory=MaskSettings)
     output_dir: str = "sample-docs"
+    # Write the masked render of every OCR request to `output_dir`. Off by
+    # default: the API never serves the file, and it leaves ID images on disk.
+    # The Streamlit/CLI tools turn it on.
+    save_masked_output: bool = field(
+        default_factory=lambda: _env_bool("KYC_SAVE_MASKED", False))
     # Working resolution for the located/cropped OCR stage.
     work_max_side: int = 2000
 

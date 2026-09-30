@@ -198,7 +198,13 @@ docker inspect --format '{{.State.Health.Status}}' kyc-ocr
 
 | Var | Default | Notes |
 |---|---|---|
-| `KYC_ENABLE_SURYA` | `false` | Surya fallback OCR. Off — deps are brittle and it adds ~1.5–2 GB per worker. If you enable it, **drop `WEB_CONCURRENCY` to 1** on this 4 GB box. |
+| `KYC_ENABLE_SURYA` | `false` | Surya fallback OCR. Off — deps are brittle and it adds ~1.5–2 GB per worker. The default image doesn't include it: build with `--build-arg WITH_SURYA=true`, and **drop `WEB_CONCURRENCY` to 1** on this 4 GB box. |
+| `KYC_ORT_THREADS` | `1` | ONNX Runtime threads per worker (0 = one per physical core). Keep `WEB_CONCURRENCY × KYC_ORT_THREADS ≤ vCPUs`. |
+| `KYC_MASK_CONCURRENCY` | `1` | Mask jobs allowed at once per worker, so background masking can't starve extractions. |
+| `KYC_MAX_UPLOAD_MB` | `25` | Larger uploads get 413. |
+| `KYC_SAVE_MASKED` | `false` | Write each OCR request's masked render to `sample-docs/` (debug only — it leaves ID images on disk). |
+| `KYC_DET_MAX_SIDE` | `0` | Cap the text detector's input size. Faster, but 1280 measurably lost fields — leave at 0. |
+| `KYC_REC_MODEL` / `KYC_REC_KEYS` | unset | Swap the recognition ONNX model (+ its character list). Evaluate with `tests/eval_aadhaar.py` first. |
 | `WEB_CONCURRENCY` | `2` | gunicorn workers (tuned for 2 vCPU). |
 | `GUNICORN_TIMEOUT` | `120` | Covers cold-start model load + slow PDFs. |
 | mem limit | `3g` | Container hard cap so the OS + nginx keep headroom. |
@@ -213,7 +219,7 @@ re-download. `sample-docs` is a bind mount for masked-image output.
 ```bash
 cd kyc-test
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 uvicorn api:app --reload --port 8000        # FastAPI, /docs for interactive testing
 # or the whole container:
 docker build -t recriviodev/kyc-ocr:dev . && docker run --rm -p 8000:8000 recriviodev/kyc-ocr:dev

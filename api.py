@@ -21,11 +21,13 @@ The response body is exactly the contract documented in
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import logging
 import os
 import tempfile
-from typing import Literal, Optional
+from typing import AsyncIterator, Literal, Optional
 
 import cv2
 import numpy as np
@@ -33,8 +35,14 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from kyc_pipeline import DocumentPipeline
+from config import _env_int
+from kyc_pipeline import DocumentLoadError, DocumentPipeline
 from output_schema import failure_envelope, success_envelope
+
+log = logging.getLogger("uvicorn.error")
+
+# Uploads larger than this are rejected with 413 before any decoding.
+MAX_UPLOAD_BYTES = _env_int("KYC_MAX_UPLOAD_MB", 25) * 1024 * 1024
 
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
 
@@ -49,7 +57,13 @@ _MASK_DOC_MAP = {
     "driving-license": "DRIVING_LICENSE",
 }
 
-app = FastAPI(title="Recrivio KYC OCR", version="1.0.0")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await _warmup()
+    yield
+
+
+app = FastAPI(title="Recrivio KYC OCR", version="1.0.0", lifespan=_lifespan)
 
 # Permissive CORS for the frontend — tighten this in production.
 app.add_middleware(
@@ -61,6 +75,11 @@ app.add_middleware(
 
 # One pipeline instance for the process lifetime — the OCR models load once.
 _pipeline = DocumentPipeline()
+
+# Masking runs in the background for the caller, but it is as CPU-heavy as an
+# extraction and shares the same cores. Cap how many run at once per worker so
+# a burst of mask jobs can't queue user-facing extractions behind them.
+_mask_slots = asyncio.Semaphore(max(1, _env_int("KYC_MASK_CONCURRENCY", 1)))
 
 # Deep-readiness state. `/healthz` returns 200 only when the models are loaded
 # AND a startup self-test drove a document through the ENTIRE pipeline without
@@ -91,7 +110,6 @@ def _selftest_image() -> "np.ndarray":
     return img
 
 
-@app.on_event("startup")
 async def _warmup() -> None:
     global _selftest_ok, _selftest_error
     _pipeline._ensure_ocr()
@@ -106,8 +124,8 @@ async def _warmup() -> None:
     except Exception as exc:  # any failure ⇒ not ready
         _selftest_ok = False
         _selftest_error = f"{type(exc).__name__}: {exc}"
-        logging.getLogger("uvicorn.error").error(
-            "OCR startup self-test FAILED — reporting unhealthy: %s", _selftest_error)
+        log.error("OCR startup self-test FAILED — reporting unhealthy: %s",
+                  _selftest_error)
     finally:
         try:
             os.remove(path)
@@ -132,19 +150,59 @@ def healthz():
     )
 
 
-async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
+class _UploadError(Exception):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+@contextlib.asynccontextmanager
+async def _upload_to_tempfile(file: UploadFile) -> AsyncIterator[str]:
+    """Spool the upload to a temp file (the pipeline reads by path so cv2 can
+    honour EXIF orientation / pdfium can open PDFs) and always delete it."""
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not data:
+        raise _UploadError("Empty file", 400)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise _UploadError(
+            f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB", 413)
     suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
     fd, path = tempfile.mkstemp(suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(await file.read())
-
-        result = await _pipeline.process_and_verify(path, doc_type.upper())
+            f.write(data)
+        yield path
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(path)
-        except OSError:
-            pass
+
+
+def _error(message: str, status: int) -> JSONResponse:
+    return JSONResponse(content=failure_envelope(message, status=status),
+                        status_code=status)
+
+
+async def _guarded(coro_fn, file: UploadFile, *args):
+    """Run a pipeline entry point on the uploaded file, mapping bad input to
+    4xx and anything unexpected to a logged 500 in the standard envelope
+    (instead of FastAPI's bare-text 500)."""
+    try:
+        async with _upload_to_tempfile(file) as path:
+            return await coro_fn(path, *args)
+    except _UploadError as e:
+        return _error(str(e), e.status)
+    except DocumentLoadError as e:        # undecodable image / PDF
+        return _error(str(e), 422)
+    except Exception:
+        log.exception("pipeline failed")
+        return _error("Internal error while processing the document", 500)
+
+
+async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
+    result = await _guarded(_pipeline.process_and_verify, file,
+                            doc_type.upper())
+    if isinstance(result, JSONResponse):
+        return result
 
     payload = result.get("output_json")
     if payload is None:
@@ -217,17 +275,10 @@ async def mask_identity_endpoint(
             status_code=400,
         )
 
-    suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(await file.read())
-        result = await _pipeline.mask_identity(path, internal)
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    async with _mask_slots:
+        result = await _guarded(_pipeline.mask_identity, file, internal)
+    if isinstance(result, JSONResponse):
+        return result
 
     # Document couldn't be processed at all ⇒ failure (bad type / OCR down /
     # encode error). 4xx = permanent (don't retry), 5xx = transient.

@@ -18,16 +18,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install CPU-only torch / torchvision FIRST so the requirements.txt install
-# below sees them already satisfied and doesn't pull the CUDA wheels.
-RUN pip install --upgrade pip setuptools wheel \
- && pip install \
-        --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.8.0 \
-        torchvision==0.23.0
+# Surya (torch + transformers, ~2 GB) is opt-in: the fallback is disabled at
+# runtime by default, so the standard image doesn't carry it. Build with
+# `--build-arg WITH_SURYA=true` to include it.
+ARG WITH_SURYA=false
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt \
+RUN pip install --upgrade pip setuptools wheel
+
+COPY requirements.txt requirements-surya.txt ./
+# With Surya: install CPU-only torch / torchvision FIRST so the requirements
+# install below sees them already satisfied and doesn't pull the CUDA wheels.
+RUN if [ "$WITH_SURYA" = "true" ]; then \
+        pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchvision==0.23.0 \
+     && pip install -r requirements-surya.txt; \
+    else \
+        pip install -r requirements.txt; \
+    fi \
  && pip install gunicorn==23.0.0
 
 # ---------- Stage 2: runtime ----------
@@ -40,12 +47,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/venv/bin:$PATH" \
     # Hugging Face / Surya cache lives on a mounted volume so models aren't
-    # re-downloaded on every container restart.
+    # re-downloaded on every container restart (only used WITH_SURYA).
     HF_HOME=/cache/huggingface \
     TRANSFORMERS_CACHE=/cache/huggingface \
     TORCH_HOME=/cache/torch \
-    # ONNX & BLAS threading: one thread per worker, gunicorn fans out via
-    # multiple workers instead. Prevents thread storms on 2 vCPU.
+    # BLAS threading: one thread per worker. ONNX Runtime ignores these and
+    # sizes its own pool from KYC_ORT_THREADS (see config.py).
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1

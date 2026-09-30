@@ -14,6 +14,13 @@ services:
       # AND dropping WEB_CONCURRENCY to 1 (Surya ~+2 GB resident per worker).
       KYC_ENABLE_SURYA: "false"
       WEB_CONCURRENCY: "2"
+      # ONNX Runtime threads per worker (0 = one per physical core). Keep
+      # WEB_CONCURRENCY x KYC_ORT_THREADS <= vCPUs.
+      KYC_ORT_THREADS: "1"
+      # Background mask jobs allowed at once per worker, so masking can't
+      # queue user-facing extractions behind it.
+      KYC_MASK_CONCURRENCY: "1"
+      KYC_MAX_UPLOAD_MB: "25"
       GUNICORN_TIMEOUT: "120"
       GUNICORN_LOG_LEVEL: "info"
 

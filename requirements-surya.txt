@@ -1,0 +1,11 @@
+# Optional Surya fallback OCR (KYC_ENABLE_SURYA=true). Adds ~2 GB to the image
+# and ~1.5-2 GB RSS per worker once loaded — not viable on small hosts.
+#
+# surya-ocr pins THIS headless OpenCV build, while rapidocr-onnxruntime depends
+# on the full opencv-python. They share the `cv2` namespace, so whichever pip
+# installs last wins the import.
+-r requirements.txt
+opencv-python-headless==4.11.0.86
+surya-ocr==0.17.0
+torch==2.8.0
+torchvision==0.23.0

@@ -20,7 +20,8 @@ contract, and produces a redacted image.
 ```bash
 # 1. Setup
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt     # API deps + Streamlit
+# (requirements.txt = API only; requirements-surya.txt = optional Surya fallback)
 
 # 2. FastAPI service (for frontends)
 uvicorn api:app --reload --port 8000

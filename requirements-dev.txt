@@ -1,0 +1,4 @@
+# Local tooling: Streamlit debug UIs (app.py, mask_identity_app.py).
+-r requirements.txt
+streamlit==1.48.1
+requests

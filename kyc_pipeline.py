@@ -17,10 +17,11 @@ than a single failing crop.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -32,6 +33,12 @@ from ocr_engines import RapidOCREngine, SuryaOCREngine, run_extract_async
 from output_schema import build_output_json, failure_envelope
 from preprocessing import (auto_crop_document, crop_document, deskew,
                           resize_for_ocr, rotate_image)
+
+log = logging.getLogger(__name__)
+
+
+class DocumentLoadError(ValueError):
+    """The upload isn't a readable image / PDF (the API answers 422)."""
 
 
 class DocumentPipeline:
@@ -84,10 +91,14 @@ class DocumentPipeline:
         if self.primary_ocr is None:
             try:
                 self.primary_ocr = RapidOCREngine(
-                    lang=self.settings.ocr.primary_lang)
+                    lang=self.settings.ocr.primary_lang,
+                    threads=self.settings.ocr.threads,
+                    det_max_side=self.settings.ocr.det_max_side,
+                    rec_model_path=self.settings.ocr.rec_model_path,
+                    rec_keys_path=self.settings.ocr.rec_keys_path)
                 self.ocr_available = True
-            except Exception as e:                   # noqa: BLE001
-                print(f"[ERROR] RapidOCR init failed: {e}")
+            except Exception:
+                log.exception("RapidOCR init failed")
                 self.ocr_available = False
         if self.layout is None and self.primary_ocr is not None:
             self.layout = LayoutDetector(
@@ -103,7 +114,7 @@ class DocumentPipeline:
                 self.fallback_ocr = SuryaOCREngine(
                     lang=self.settings.ocr.primary_lang)
             except Exception as e:                   # noqa: BLE001
-                print(f"[WARN] Surya fallback unavailable: {e}")
+                log.warning("Surya fallback unavailable: %s", e)
 
     def get_printable_name(self, doc: str) -> str:
         return self.DISPLAY_NAMES.get(doc, "Unknown")
@@ -111,18 +122,110 @@ class DocumentPipeline:
     # ── Image loading ────────────────────────────────────────────────────────
 
     def load_document_image(self, path: str) -> np.ndarray:
+        """Decode the upload. Raises DocumentLoadError for anything that isn't
+        a readable image / PDF — the API maps that to a 422."""
         if path.lower().rsplit(".", 1)[-1] == "pdf":
-            pdf = pdfium.PdfDocument(path)
-            pil = pdf[0].render(scale=3).to_pil()
-            return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            try:
+                pdf = pdfium.PdfDocument(path)
+                page = pdf[0]
+                # Render straight at working resolution instead of a fixed 3x
+                # (a large-format page at 3x is a multi-hundred-MB bitmap).
+                pw, ph = page.get_size()
+                scale = min(3.0, self.settings.work_max_side / max(pw, ph, 1))
+                pil = page.render(scale=scale).to_pil()
+            except Exception as e:                   # noqa: BLE001
+                raise DocumentLoadError(f"Cannot read PDF: {e}") from e
+            return cv2.cvtColor(np.array(pil.convert("RGB")),
+                                cv2.COLOR_RGB2BGR)
         img = cv2.imread(path)
         if img is None:
-            raise ValueError(f"Cannot load image: {path}")
+            raise DocumentLoadError("Cannot decode image")
         return img
 
     # ── Stage helper: orientation ────────────────────────────────────────────
 
+    # Orientation-probe decision thresholds: the dominant line direction must
+    # outweigh the other by this factor, and the angle-class vote must be at
+    # least this lopsided, before the cheap probe's answer is trusted.
+    _ORIENT_DOMINANCE = 3.0
+    _ORIENT_VOTE = 0.3
+    # Only angle-class verdicts at least this sure count as votes — small or
+    # blurry lines (dense e-Aadhaar letters) otherwise split the vote.
+    _ORIENT_CLS_MIN = 0.9
+
+    @classmethod
+    def _line_direction(cls, lines) -> Optional[str]:
+        """"wide" / "tall" when one text direction clearly dominates."""
+        wide_len = sum(w for w, h, _, _ in lines if w >= 1.5 * h)
+        tall_len = sum(h for w, h, _, _ in lines if h >= 1.5 * w)
+        if wide_len >= cls._ORIENT_DOMINANCE * tall_len and wide_len > 0:
+            return "wide"
+        if tall_len >= cls._ORIENT_DOMINANCE * wide_len and tall_len > 0:
+            return "tall"
+        return None
+
+    @classmethod
+    def _orientation_from_lines(cls, lines) -> Optional[int]:
+        """Decide the upright angle from ``(w, h, cls_label, cls_score)`` line
+        stats (RapidOCREngine.probe_orientation). Returns None when the signal
+        is ambiguous.
+
+          * Line direction: horizontal text yields wide quads, sideways text
+            tall ones. Tall crops are stood up by a 90° counter-clockwise turn
+            before the angle classifier sees them.
+          * Angle class: says whether each (stood-up) line reads upside down.
+
+        So wide + "0" ⇒ upright; wide + "180" ⇒ 180°; tall + "0" ⇒ the page
+        needs a 90° counter-clockwise turn (270); tall + "180" ⇒ 90°. Votes are
+        weighted by line length so long, confidently-read lines dominate."""
+        if len(lines) < 3:
+            return None
+        direction = cls._line_direction(lines)
+        if direction == "wide":
+            group = [(w, c) for w, h, c, s in lines
+                     if w >= 1.5 * h and s >= cls._ORIENT_CLS_MIN]
+            upright, flipped = 0, 180
+        elif direction == "tall":
+            group = [(h, c) for w, h, c, s in lines
+                     if h >= 1.5 * w and s >= cls._ORIENT_CLS_MIN]
+            upright, flipped = 270, 90
+        else:
+            return None
+        total = sum(n for n, _ in group)
+        if not total:
+            return None
+        frac180 = sum(n for n, c in group if c == "180") / total
+        if frac180 <= cls._ORIENT_VOTE:
+            return upright
+        if frac180 >= 1.0 - cls._ORIENT_VOTE:
+            return flipped
+        return None
+
     async def _detect_orientation(self, img: np.ndarray) -> int:
+        """Upright angle (0/90/180/270) for `img`.
+
+        A single detection + angle-class probe on a downscaled copy settles
+        the clear cases (the vast majority) for a fraction of the cost of the
+        4-angle full-OCR probe, which is kept as the fallback for ambiguous
+        pages (few lines, mixed directions, split vote)."""
+        if not self.settings.layout.detect_orientation:
+            return 0
+        small = resize_for_ocr(
+            img, max_side=self.settings.layout.orientation_probe_side)
+        lines = await asyncio.to_thread(
+            self.primary_ocr.probe_orientation, small)
+        angle = self._orientation_from_lines(lines)
+        if angle is not None:
+            return angle
+        # Direction known but the up/down vote split: only two angles remain.
+        direction = self._line_direction(lines)
+        candidates = {"wide": (0, 180), "tall": (90, 270)}.get(
+            direction, (0, 90, 180, 270))
+        return await self._detect_orientation_full(img, candidates)
+
+    async def _detect_orientation_full(
+            self, img: np.ndarray,
+            candidates: Tuple[int, ...] = (0, 90, 180, 270)) -> int:
         """Pick the upright angle by combining two cheap signals:
 
           * landscape-bbox count — RapidOCR returns each text line as a
@@ -138,18 +241,15 @@ class DocumentPipeline:
 
         Score = landscape_count × avg_conf × text_len. The four probes
         run concurrently on a 720-px downscaled copy."""
-        if not self.settings.layout.detect_orientation:
-            return 0
-
         small = resize_for_ocr(img, max_side=720)
-        rots = [rotate_image(small, a) for a in (0, 90, 180, 270)]
+        rots = [rotate_image(small, a) for a in candidates]
         outs = await asyncio.gather(
             *(asyncio.to_thread(self.primary_ocr.extract_no_cls, r)
               for r in rots),
             return_exceptions=True,
         )
-        best_angle, best_score = 0, -1.0
-        for angle, res in zip((0, 90, 180, 270), outs):
+        best_angle, best_score = candidates[0], -1.0
+        for angle, res in zip(candidates, outs):
             if isinstance(res, Exception) or res is None:
                 continue
             n_landscape = sum(
@@ -195,28 +295,40 @@ class DocumentPipeline:
                                 "engine": res.engine})
         return results
 
-    async def _read_fused(self, work: np.ndarray) -> List[Dict]:
+    # Aadhaar backs print the English address in a light, often worn font; a
+    # lower detector box threshold keeps those faint lines (measured: address
+    # 10/17 -> 13/17 on the labelled set). Other document types keep RapidOCR's
+    # default — on passports the extra boxes break back-page classification.
+    _BOX_THRESH = {"AADHAAR": 0.3}
+
+    async def _read_fused(self, work: np.ndarray,
+                          box_thresh: float = 0.0) -> List[Dict]:
         """Generic line backend: detection + recognition are a single fused
         ONNX pass. Re-cropping each detected line and re-OCRing it only
         fragments words and loses context, so we don't — the fused pass
         already yields per-line box + text + confidence.
 
-        The fused pass does, however, silently drop any line whose
-        recognition confidence falls below RapidOCR's internal
-        `text_score` gate. `_recover_dropped_lines` adds those back; that
-        step is purely additive — every line the fused pass returned is
-        left exactly as-is."""
-        res = await run_extract_async(self.primary_ocr, work)
+        Lines scoring below RapidOCR's `text_score` gate are returned by
+        `read()` too (the stock call drops them); `_recover_dropped_lines`
+        re-reads those from a padded crop. That step is purely additive —
+        every line that passed the gate is left exactly as-is."""
+        lines = await asyncio.to_thread(self.primary_ocr.read, work,
+                                        box_thresh)
+        gate = self.primary_ocr.TEXT_SCORE
+        kept = [wb for wb in lines if (wb.confidence or 0.0) >= gate]
+        dropped = [wb for wb in lines if (wb.confidence or 0.0) < gate]
         results = [
             {"region": Region(wb.bbox, "text_line", 1.0),
              "crop": self._crop(work, wb.bbox),
              "text": wb.text,
              "conf": wb.confidence or 0.0,
-             "engine": "rapidocr"}
-            for wb in res.words
+             "engine": "rapidocr",
+             "cls": (wb.cls_label, wb.cls_score)}
+            for wb in kept
         ]
-        results += await asyncio.to_thread(
-            self._recover_dropped_lines, work, res.words)
+        if dropped:
+            results += await asyncio.to_thread(
+                self._recover_dropped_lines, work, kept, dropped)
         return results
 
     @staticmethod
@@ -239,28 +351,30 @@ class DocumentPipeline:
                 return True
         return False
 
-    def _recover_dropped_lines(self, work: np.ndarray,
-                               found_words) -> List[Dict]:
-        """Re-OCR text regions the fused pass located but discarded.
+    def _recover_dropped_lines(self, work: np.ndarray, found_words,
+                               dropped_words) -> List[Dict]:
+        """Re-OCR text lines the fused pass located but scored below the gate.
 
-        RapidOCR's detector reports a box for every text line, but the
-        fused detect+recognise pass silently drops any line whose
-        recognition confidence is below its internal `text_score` gate —
-        which happens when the detector hands the recogniser a clipped
-        quad (a tight DOB date is a frequent victim). A detection-only
-        pass still reports the box; recognising the padded crop with
-        detection OFF reads it at full confidence.
+        The detector reports a box for every text line, but a line whose
+        recognition confidence is below `text_score` is discarded — which
+        happens when the detector hands the recogniser a clipped quad (a
+        tight DOB date is a frequent victim). Recognising the padded
+        axis-aligned crop instead reads it at full confidence. All crops go
+        through the recogniser in one batched call.
         """
-        recovered: List[Dict] = []
-        for box in self.primary_ocr.detect(work):
-            if self._box_covered(box, found_words):
+        boxes, crops = [], []
+        for wb in dropped_words:
+            if self._box_covered(wb.bbox, found_words):
                 continue
-            crop = self._crop(work, box, pad=8)
+            crop = self._crop(work, wb.bbox, pad=8)
             if crop.size == 0:
                 continue
-            rec = self.primary_ocr.extract_rec_only(crop)
-            text = rec.text.strip()
-            conf = rec.avg_confidence or 0.0
+            boxes.append(wb.bbox)
+            crops.append(crop)
+        recovered: List[Dict] = []
+        for box, crop, (text, conf) in zip(
+                boxes, crops, self.primary_ocr.recognize(crops)):
+            text = text.strip()
             # Keep only confident, non-trivial reads so a forced
             # recognition of a stray graphic cannot inject noise.
             if conf >= 0.5 and any(ch.isalnum() for ch in text):
@@ -271,13 +385,14 @@ class DocumentPipeline:
                 })
         return recovered
 
-    async def _locate_and_read(self, work: np.ndarray) -> List[Dict]:
+    async def _locate_and_read(self, work: np.ndarray,
+                               box_thresh: float = 0.0) -> List[Dict]:
         """Stage 1+2 then Stage 3: produce per-region text, then Surya-retry
         only the low-confidence regions (concurrently)."""
         if self.layout.backend == "yolo":
             results = await self._read_field_regions(work)
         else:
-            results = await self._read_fused(work)
+            results = await self._read_fused(work, box_thresh)
 
         # ── Stage 3: Surya — ONLY on the low-confidence crops ──
         weak = [i for i, r in enumerate(results)
@@ -298,6 +413,30 @@ class DocumentPipeline:
                         results[i].update(text=res.text, conf=fb_conf,
                                           engine="surya")
         return results
+
+    async def _read_upright(self, work: np.ndarray, angle: int,
+                            box_thresh: float = 0.0
+                            ) -> Tuple[np.ndarray, int, List[Dict]]:
+        """Read `work`, then double-check its orientation with the per-line
+        angle classes the read produced for free. If the lines say the page
+        is still sideways/upside down (the probe got it wrong), turn it and
+        read once more. Returns ``(work, angle, region_results)``."""
+        results = await self._locate_and_read(work, box_thresh)
+        if not self.settings.layout.detect_orientation:
+            return work, angle, results
+        stats = []
+        for r in results:
+            if "cls" not in r:
+                continue
+            x1, y1, x2, y2 = r["region"].bbox
+            stats.append((x2 - x1, y2 - y1, r["cls"][0], r["cls"][1]))
+        fix = self._orientation_from_lines(stats)
+        if fix:
+            log.info("orientation re-check: turning page a further %d°", fix)
+            work = rotate_image(work, fix)
+            results = await self._locate_and_read(work, box_thresh)
+            angle = (angle + fix) % 360
+        return work, angle, results
 
     # ── Classification & extraction ──────────────────────────────────────────
 
@@ -363,7 +502,7 @@ class DocumentPipeline:
         if re.search(r"\b[A-Z]{1,2}\d{6,7}\b", text):
             scores["PASSPORT"] += 30
 
-        print("CLASS SCORES:", scores)
+        log.debug("class scores: %s", scores)
         top = max(scores, key=scores.get)
         return top if scores[top] else "UNKNOWN"
 
@@ -483,7 +622,7 @@ class DocumentPipeline:
             drawn += 1
 
         if drawn == 0:
-            print("[WARN] No sensitive region located — nothing masked.")
+            log.warning("No sensitive region located — nothing masked.")
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)),
                     exist_ok=True)
@@ -556,35 +695,13 @@ class DocumentPipeline:
             rects.append((bx1, by1, bx2, by2, conf, field_name))
         return rects
 
-    # ── Coordinate transform: work-image space ⇄ original-image space ────────
-
-    @staticmethod
-    def _rot90_affine(img: np.ndarray, angle: int):
-        """Apply rotate_image(img, angle) and return (3×3 affine, rotated).
-
-        The affine maps a point in `img` to its location in the rotated
-        output — matching cv2.rotate's 90° steps exactly — so it can be
-        composed into the full original→work transform."""
-        H, W = img.shape[:2]
-        rotated = rotate_image(img, angle)
-        a = angle % 360
-        if a == 90:        # ROTATE_90_CLOCKWISE:        (x, y) → (H-1-y, x)
-            T = np.array([[0, -1, H - 1], [1, 0, 0], [0, 0, 1]], dtype=float)
-        elif a == 180:     # ROTATE_180:                 (x, y) → (W-1-x, H-1-y)
-            T = np.array([[-1, 0, W - 1], [0, -1, H - 1], [0, 0, 1]], dtype=float)
-        elif a == 270:     # ROTATE_90_COUNTERCLOCKWISE: (x, y) → (y, W-1-x)
-            T = np.array([[0, 1, 0], [-1, 0, W - 1], [0, 0, 1]], dtype=float)
-        else:              # 0° (or generic, treated as identity for mapping)
-            T = np.eye(3, dtype=float)
-        return T, rotated
-
     async def _preprocess_for_display(
             self, img: np.ndarray, crop: bool = True) -> Tuple[np.ndarray, bool]:
         """Produce the render returned to the caller by /mask-identity:
         the document cropped out of its background, straightened, stood
         upright, and sized for OCR.
 
-        Unlike `_preprocess_with_transform` (used by the OCR contract, whose
+        Unlike `_preprocess_ocr` (used by the OCR contract, whose
         `auto_crop_document` deliberately refuses any crop that would drop
         >30% of the frame) this uses `crop_document`, which finds the document
         quad against the background and perspective-warps it. That is what
@@ -598,17 +715,21 @@ class DocumentPipeline:
         merely straightened and stood upright — the retry path for when the
         crop amputated the ID strip. Returns ``(work, did_crop)`` so the caller
         can tell whether a crop actually happened and decide to retry."""
-        if crop:
-            cropped, dbg = crop_document(img)
-            did_crop = bool(dbg.get("cropped"))
-        else:
-            cropped, did_crop = img, False
-        # Residual skew (the quad warp already removes rotation; this is a
-        # no-op on a straight image, and it rescues the fallback crop path).
-        straight, _ = deskew(cropped)
+        def _crop_and_straighten() -> Tuple[np.ndarray, bool]:
+            if crop:
+                cropped, dbg = crop_document(img)
+                did = bool(dbg.get("cropped"))
+            else:
+                cropped, did = img, False
+            # Residual skew (the quad warp already removes rotation; this is a
+            # no-op on a straight image, and it rescues the fallback crop path).
+            return deskew(cropped)[0], did
+
+        # CPU-bound OpenCV work runs off the event loop.
+        straight, did_crop = await asyncio.to_thread(_crop_and_straighten)
         angle = await self._detect_orientation(straight)
-        upright = rotate_image(straight, angle)
-        work = resize_for_ocr(upright, max_side=self.settings.work_max_side)
+        work = resize_for_ocr(rotate_image(straight, angle),
+                              max_side=self.settings.work_max_side)
         return work, did_crop
 
     async def _preprocess_ocr(
@@ -620,70 +741,20 @@ class DocumentPipeline:
         With ``crop=False`` the contour `auto_crop_document` is skipped and the
         full frame is used — the retry path for when a crop amputated the ID
         strip. Returns ``(work, did_crop, angle)``."""
-        if crop:
-            base, crop_dbg = auto_crop_document(img)
-            did_crop = bool(crop_dbg.get("cropped"))
-        else:
-            base, did_crop = img, False
-        desk, _ = deskew(base)
+        def _crop_and_straighten() -> Tuple[np.ndarray, bool]:
+            if crop:
+                base, crop_dbg = auto_crop_document(img)
+                did = bool(crop_dbg.get("cropped"))
+            else:
+                base, did = img, False
+            return deskew(base)[0], did
+
+        # CPU-bound OpenCV work runs off the event loop.
+        desk, did_crop = await asyncio.to_thread(_crop_and_straighten)
         angle = await self._detect_orientation(desk)
         work = resize_for_ocr(rotate_image(desk, angle),
                               max_side=self.settings.work_max_side)
         return work, did_crop, angle
-
-    async def _preprocess_with_transform(self, img: np.ndarray):
-        """Run the same crop→deskew→orient→resize chain as process_and_verify,
-        but also accumulate the 3×3 affine that maps ORIGINAL image coords to
-        the returned `work` image coords. Inverting it projects mask boxes
-        found on `work` back onto the caller's original image."""
-        T = np.eye(3, dtype=float)
-
-        # 1. auto-crop — an axis-aligned crop, i.e. a pure translation.
-        cropped, crop_dbg = auto_crop_document(img)
-        if crop_dbg.get("cropped"):
-            cx1, cy1, _, _ = crop_dbg["bbox"]
-            Tc = np.eye(3, dtype=float); Tc[0, 2] = -cx1; Tc[1, 2] = -cy1
-            T = Tc @ T
-
-        # 2. deskew — rotation about the cropped image centre (dims preserved).
-        desk, desk_dbg = deskew(cropped)
-        if desk_dbg.get("deskewed"):
-            ch, cw = cropped.shape[:2]
-            M = cv2.getRotationMatrix2D((cw // 2, ch // 2),
-                                        desk_dbg["angle_deg"], 1.0)
-            Td = np.eye(3, dtype=float); Td[:2, :] = M
-            T = Td @ T
-
-        # 3. orientation — 0/90/180/270.
-        angle = await self._detect_orientation(desk)
-        Tr, rotated = self._rot90_affine(desk, angle)
-        T = Tr @ T
-
-        # 4. resize for OCR — uniform downscale (only if larger than max_side).
-        work = resize_for_ocr(rotated, max_side=self.settings.work_max_side)
-        rh, rw = rotated.shape[:2]
-        if max(rh, rw) > self.settings.work_max_side:
-            s = self.settings.work_max_side / float(max(rh, rw))
-            Ts = np.eye(3, dtype=float); Ts[0, 0] = s; Ts[1, 1] = s
-            T = Ts @ T
-
-        return work, T
-
-    @staticmethod
-    def _project_box(box, T_inv, orig_shape):
-        """Map an axis-aligned work-space box through T_inv and return its
-        axis-aligned bounding box in original-image coords (clamped). For a
-        rotated/deskewed page the work box maps to a tilted quad — taking its
-        bounding box over-masks slightly, which is the safe direction."""
-        h, w = orig_shape[:2]
-        x1, y1, x2, y2 = box
-        corners = np.array([[x1, y1, 1], [x2, y1, 1],
-                            [x2, y2, 1], [x1, y2, 1]], dtype=float).T
-        proj = T_inv @ corners
-        xs = proj[0] / proj[2]; ys = proj[1] / proj[2]
-        ox1 = max(0, int(np.floor(xs.min()))); oy1 = max(0, int(np.floor(ys.min())))
-        ox2 = min(w - 1, int(np.ceil(xs.max()))); oy2 = min(h - 1, int(np.ceil(ys.max())))
-        return ox1, oy1, ox2, oy2
 
     async def mask_identity(self, path: str, doc_type: str) -> Dict:
         """Return two cropped + deskewed + upright ("work"-space) renders of
@@ -731,11 +802,12 @@ class DocumentPipeline:
         # actually happened, re-read the full uncropped frame. The unmasked
         # image is encoded from whichever render won, so a recovered document
         # is returned cropped-or-full rather than lost.
-        img = self.load_document_image(path)
+        img = await asyncio.to_thread(self.load_document_image, path)
 
         async def _attempt(crop: bool) -> Dict:
             w, did_crop = await self._preprocess_for_display(img, crop=crop)
-            rr = await self._locate_and_read(w)
+            w, _, rr = await self._read_upright(
+                w, 0, self._BOX_THRESH.get(doc_type, 0.0))
             ft = "\n".join(r["text"] for r in rr if r["text"]).upper()
             ext = self.verify_and_extract(ft, doc_type)
             return {"work": w, "did_crop": did_crop,
@@ -826,11 +898,12 @@ class DocumentPipeline:
         # full uncropped frame before giving up. If neither finds the ID we
         # still fail — the retry only ever rescues an over-crop, never masks a
         # genuinely unreadable document.
-        img = self.load_document_image(path)
+        img = await asyncio.to_thread(self.load_document_image, path)
 
         async def _attempt(crop: bool) -> Dict:
             work, did_crop, angle = await self._preprocess_ocr(img, crop=crop)
-            rr = await self._locate_and_read(work)
+            work, angle, rr = await self._read_upright(
+                work, angle, self._BOX_THRESH.get(intended, 0.0))
             ft = "\n".join(r["text"] for r in rr if r["text"]).upper()
             act = self.classify_document(ft)
             ext = (self.verify_and_extract(ft, act)
@@ -883,14 +956,18 @@ class DocumentPipeline:
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
-        # ── Stage 4: direct masking ──
-        # Force a raster extension: the masked output is always an image, but
-        # the input may be a PDF/webp whose extension cv2.imwrite can't encode.
-        stem = os.path.splitext(os.path.basename(path))[0]
-        out_path = os.path.join(
-            self.settings.output_dir, f"masked_{stem}.png")
-        masked = self.create_masked_image(
-            work, region_results, extracted, actual, out_path)
+        # ── Stage 4: direct masking (debug/CLI only — the API never serves
+        # this file, so by default nothing is written to disk) ──
+        masked = None
+        if self.settings.save_masked_output:
+            # Force a raster extension: the input may be a PDF/webp whose
+            # extension cv2.imwrite can't encode.
+            stem = os.path.splitext(os.path.basename(path))[0]
+            out_path = os.path.join(
+                self.settings.output_dir, f"masked_{stem}.png")
+            masked = await asyncio.to_thread(
+                self.create_masked_image,
+                work, region_results, extracted, actual, out_path)
 
         result.update({
             "status": "SUCCESS",

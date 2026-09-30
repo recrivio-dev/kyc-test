@@ -1,5 +1,6 @@
 import asyncio
 import os
+from config import Settings
 from kyc_pipeline import DocumentPipeline
 
 DOC_MAPPING = {
@@ -11,7 +12,7 @@ DOC_MAPPING = {
 }
 
 def print_results(result):
-    pipeline = DocumentPipeline()
+    pipeline = DocumentPipeline(Settings(save_masked_output=True))
     print("\n" + "="*40)
     print(" RAW OCR EXTRACTED TEXT ")
     print("="*40)
@@ -33,7 +34,7 @@ def print_results(result):
     print("-" * 24 + "\n")
 
 def run_interactive_pipeline():
-    pipeline = DocumentPipeline()
+    pipeline = DocumentPipeline(Settings(save_masked_output=True))
     
     while True:
         print("\n--- Document Classifier, Verifier & Masker ---")

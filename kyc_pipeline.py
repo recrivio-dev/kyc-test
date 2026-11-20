@@ -30,7 +30,9 @@ import pypdfium2 as pdfium
 from config import SETTINGS, Settings
 from layout_detector import LayoutDetector, Region
 from ocr_engines import RapidOCREngine, SuryaOCREngine, run_extract_async
-from output_schema import build_output_json, failure_envelope
+from output_schema import (AADHAAR_PATTERN, DL_LEGACY_PATTERN,
+                           MASKED_AADHAAR_PATTERN, build_output_json,
+                           failure_envelope, find_masked_aadhaar)
 from preprocessing import (auto_crop_document, crop_document, deskew,
                           resize_for_ocr, rotate_image)
 
@@ -38,7 +40,12 @@ log = logging.getLogger(__name__)
 
 
 class DocumentLoadError(ValueError):
-    """The upload isn't a readable image / PDF (the API answers 422)."""
+    """The upload isn't a readable image / PDF (the API answers 422).
+    ``code`` is the envelope ``error_code``."""
+
+    def __init__(self, message: str, code: str = "unreadable_file"):
+        super().__init__(message)
+        self.code = code
 
 
 class DocumentPipeline:
@@ -71,7 +78,7 @@ class DocumentPipeline:
 
         self.patterns = {
             "PAN": r"[A-Z]{5}[0-9]{4}[A-Z]",
-            "AADHAAR": r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)",
+            "AADHAAR": AADHAAR_PATTERN,
             "VOTER_ID": r"(?<![A-Z0-9])[A-Z]{3}\d{7}(?![A-Z0-9])",
             "PASSPORT": r"[A-Z]{1,2}\d{6,7}",
             # Real DL number OR Vehicle Registration Certificate number
@@ -81,6 +88,7 @@ class DocumentPipeline:
             # `[\s-]?` separator is allowed between every token group.
             "DRIVING_LICENSE":
                 r"[A-Z]{2}[\s-]?\d{2}[\s-]?\d{11}"
+                rf"|{DL_LEGACY_PATTERN}"
                 r"|[A-Z]{2}[\s-]?\d{1,2}[\s-]?[A-Z]{1,2}[\s-]?\d{3,5}",
         }
 
@@ -134,6 +142,14 @@ class DocumentPipeline:
                 scale = min(3.0, self.settings.work_max_side / max(pw, ph, 1))
                 pil = page.render(scale=scale).to_pil()
             except Exception as e:                   # noqa: BLE001
+                # UIDAI's e-Aadhaar PDF is encrypted (password = first 4
+                # letters of the name + birth year). Say so, instead of a
+                # generic "cannot read" that looks like a broken file.
+                if "password" in str(e).lower():
+                    raise DocumentLoadError(
+                        "PDF is password-protected — upload an unlocked "
+                        "copy or a screenshot/photo of the document",
+                        code="password_protected") from e
                 raise DocumentLoadError(f"Cannot read PDF: {e}") from e
             return cv2.cvtColor(np.array(pil.convert("RGB")),
                                 cv2.COLOR_RGB2BGR)
@@ -488,12 +504,28 @@ class DocumentPipeline:
             scores["VOTER_ID"] += 50
         if re.search(r"[A-Z]{2}[\s-]?\d{2}[\s-]?\d{11}", text):
             scores["DRIVING_LICENSE"] += 60
+        # Older state-format DL ('DLFAP025184122010'): state code + 12 digits.
+        if re.search(DL_LEGACY_PATTERN, text):
+            scores["DRIVING_LICENSE"] += 60
         if re.search(r"[A-Z]{5}[0-9]{4}[A-Z]", text):   scores["PAN"] += 50
         # Anchored exactly like the AADHAAR extraction pattern: the
         # (?<!\d)/(?!\d) guards stop a clean 12-digit run being matched
-        # inside a longer number (e.g. a 13-digit DL number).
-        if re.search(r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)", text):
+        # inside a longer number (e.g. a 13-digit DL number). The 12-digit
+        # tail of a legacy DL number is blanked out first, or it scores as an
+        # Aadhaar number and outvotes the 'DRIVING LICENCE' heading.
+        aadhaar_text = re.sub(DL_LEGACY_PATTERN, " ", text)
+        if re.search(AADHAAR_PATTERN, aadhaar_text):
             scores["AADHAAR"] += 50
+        # Issuer-masked Aadhaar ('XXXX XXXX 4270') — the 12-digit signal is
+        # gone, so score the masked form instead.
+        elif re.search(MASKED_AADHAAR_PATTERN, text) or re.search(
+                r"(?m)^\W*[X×*•#]{4}\s?[X×*•#]{4}\W*$", text):
+            # (second form: the detector split 'XXXX XXXX' from its last 4)
+            scores["AADHAAR"] += 50
+        # 'VID : 9146 3489 2265 9361' — the 16-digit Virtual ID is printed
+        # only on Aadhaar.
+        if re.search(r"\bVID\s*[:：]\s*\d{4}", text):
+            scores["AADHAAR"] += 30
 
         # Passport MRZ line is a very strong, format-specific signal.
         if re.search(r"P<[A-Z]{3}", text) or re.search(r"P<<[A-Z]", text):
@@ -524,6 +556,8 @@ class DocumentPipeline:
 
     # ── Stage 4: direct masking via layout boxes ─────────────────────────────
 
+    _VID_RX = r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}\s?\d{4}(?!\d)"
+
     def _is_id_hit(self, text: str, pattern: str, id_clean: str,
                    doc_type: str) -> bool:
         """Does this recognised region hold the ID number, or part of it?"""
@@ -532,6 +566,10 @@ class DocumentPipeline:
         if not word:
             return False
         if re.search(pattern, up):
+            return True
+        # Aadhaar's 16-digit Virtual ID can stand in for the number in
+        # authentication, so it is redacted like the number itself.
+        if doc_type == "AADHAAR" and re.search(self._VID_RX, up):
             return True
         if not id_clean:
             return False
@@ -780,6 +818,7 @@ class DocumentPipeline:
             "unmasked_image": None,      # PNG bytes: cropped + rotated
             "masked_image": None,        # PNG bytes: cropped + rotated + redacted
             "masked_regions": [],        # [x, y, w, h] in the work-image space
+            "already_masked": False,     # issuer-masked ID, nothing to redact
             "message": None,
             "status": 200,
         }
@@ -810,13 +849,17 @@ class DocumentPipeline:
                 w, 0, self._BOX_THRESH.get(doc_type, 0.0))
             ft = "\n".join(r["text"] for r in rr if r["text"]).upper()
             ext = self.verify_and_extract(ft, doc_type)
+            masked4 = (find_masked_aadhaar(rr)[0]
+                       if ext is None and doc_type == "AADHAAR" else "")
             return {"work": w, "did_crop": did_crop,
-                    "region_results": rr, "extracted": ext}
+                    "region_results": rr, "extracted": ext,
+                    "masked4": masked4}
 
         att = await _attempt(crop=True)
         if att["extracted"] is None and att["did_crop"]:
             retry = await _attempt(crop=False)
-            if retry["extracted"] is not None:
+            if retry["extracted"] is not None or (
+                    retry["masked4"] and not att["masked4"]):
                 att = retry
 
         work = att["work"]
@@ -829,6 +872,39 @@ class DocumentPipeline:
             return out
         out["unmasked_image"] = buf.tobytes()
         out["document_detected"] = extracted is not None
+
+        if extracted is None and att["masked4"]:
+            # Issuer-masked Aadhaar ('XXXX XXXX 1234'): only the last 4
+            # digits are printed and no full 12-digit number was read
+            # anywhere. Nothing to redact but a printed 16-digit VID.
+            vid_rects = self._id_mask_rects(region_results, doc_type, "",
+                                            work.shape)
+            masked_bytes = out["unmasked_image"]
+            regions_out: List[Dict] = []
+            if vid_rects:
+                vm = work.copy()
+                for (x1, y1, x2, y2, conf, _f) in vid_rects:
+                    cv2.rectangle(vm, (int(x1), int(y1)), (int(x2), int(y2)),
+                                  (0, 0, 0), -1)
+                    regions_out.append({
+                        "field": "vid",
+                        "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                        "confidence": round(float(conf), 2),
+                    })
+                ok, vbuf = cv2.imencode(".png", vm)
+                if not ok:
+                    out.update(message="Failed to encode masked image",
+                               status=500)
+                    return out
+                masked_bytes = vbuf.tobytes()
+            out.update(
+                document_detected=True,
+                masked_image=masked_bytes,
+                masked_regions=regions_out,
+                already_masked=True,
+                message="Aadhaar number is already masked on the document",
+            )
+            return out
 
         work_rects: List[Tuple] = []
         if extracted:
@@ -888,7 +964,8 @@ class DocumentPipeline:
         if not self.ocr_available:
             result["message"] = "OCR backend unavailable"
             result["output_json"] = failure_envelope(
-                "OCR backend unavailable", status=503)
+                "OCR backend unavailable", status=503,
+                error_code="ocr_unavailable")
             return result
 
         # ── preprocess + read + classify + extract, with an over-crop retry ──
@@ -908,17 +985,22 @@ class DocumentPipeline:
             act = self.classify_document(ft)
             ext = (self.verify_and_extract(ft, act)
                    if act == intended else None)
+            masked4 = ""
+            if ext is None and act == intended == "AADHAAR":
+                masked4 = find_masked_aadhaar(rr)[0]
             return {"work": work, "did_crop": did_crop, "angle": angle,
                     "region_results": rr, "full_text": ft,
-                    "actual": act, "extracted": ext}
+                    "actual": act, "extracted": ext, "masked4": masked4}
 
         att = await _attempt(crop=True)
         retried = False
         if att["extracted"] is None and att["did_crop"]:
             retried = True
             retry = await _attempt(crop=False)
-            # Keep the uncropped read only when it actually recovered the ID.
-            if retry["extracted"] is not None:
+            # Keep the uncropped read only when it actually recovered the ID
+            # (or, failing that, an issuer-masked number the crop lost).
+            if retry["extracted"] is not None or (
+                    retry["masked4"] and not att["masked4"]):
                 att = retry
 
         work = att["work"]
@@ -945,21 +1027,30 @@ class DocumentPipeline:
 
         if actual != intended:
             result["message"] = f"Expected {intended}, got {actual}"
-            result["output_json"] = failure_envelope(result["message"])
+            result["output_json"] = failure_envelope(
+                result["message"], error_code="document_mismatch")
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
         extracted = att["extracted"]
+        already_masked = False
+        if not extracted and att["masked4"]:
+            # Issuer-masked Aadhaar: the full number was never printed, so
+            # there is nothing to extract or redact — that's a success, not
+            # an OCR failure.
+            extracted = f"XXXX XXXX {att['masked4']}"
+            already_masked = True
         if not extracted:
             result["message"] = "ID extraction failed"
-            result["output_json"] = failure_envelope(result["message"])
+            result["output_json"] = failure_envelope(
+                result["message"], error_code="id_not_found")
             result["elapsed_sec"] = round(time.time() - t0, 3)
             return result
 
         # ── Stage 4: direct masking (debug/CLI only — the API never serves
         # this file, so by default nothing is written to disk) ──
         masked = None
-        if self.settings.save_masked_output:
+        if self.settings.save_masked_output and not already_masked:
             # Force a raster extension: the input may be a PDF/webp whose
             # extension cv2.imwrite can't encode.
             stem = os.path.splitext(os.path.basename(path))[0]
@@ -973,6 +1064,7 @@ class DocumentPipeline:
             "status": "SUCCESS",
             "extracted_id": extracted,
             "masked_id": self.mask_id(extracted, actual),
+            "id_already_masked": already_masked,
             "masked_image_file": masked,
             "output_json": build_output_json(actual, region_results, full_text),
             "elapsed_sec": round(time.time() - t0, 3),

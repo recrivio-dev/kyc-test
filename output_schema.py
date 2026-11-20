@@ -51,9 +51,24 @@ def _envelope(data: Dict[str, Any], *, success: bool = True,
     }
 
 
-def failure_envelope(message: str, *, status: int = 400) -> Dict[str, Any]:
-    return _envelope({}, success=False, status=status,
-                     message=message, message_code="failed")
+def failure_envelope(message: str, *, status: int = 400,
+                     error_code: str = "failed") -> Dict[str, Any]:
+    """Failure envelope. ``message_code`` stays "failed" for backward
+    compatibility; ``error_code`` says WHY, so callers can tell a genuine
+    OCR failure apart from a wrong upload, a timeout or a bad file:
+
+      document_mismatch  — the image is a different document type
+      id_not_found       — right document, but the ID number wasn't read
+      unreadable_file    — not a decodable image / PDF
+      password_protected — encrypted PDF (e.g. UIDAI e-Aadhaar download)
+      invalid_upload     — empty / oversized upload, bad form field
+      timeout            — processing exceeded the server-side deadline
+      ocr_unavailable    — OCR models not loaded (transient)
+      internal_error     — unexpected exception (transient)"""
+    env = _envelope({}, success=False, status=status,
+                    message=message, message_code="failed")
+    env["error_code"] = error_code
+    return env
 
 
 def success_envelope(data: Dict[str, Any], *, status: int = 200) -> Dict[str, Any]:
@@ -61,6 +76,61 @@ def success_envelope(data: Dict[str, Any], *, status: int = 200) -> Dict[str, An
     endpoints (e.g. /api/v1/ocr/mask-identity) whose payload isn't a per-doc OCR shape."""
     return _envelope(data, success=True, status=status,
                      message=None, message_code="success")
+
+
+# Aadhaar number: three 4-digit groups. The outer guards also reject a run
+# that is part of a 16-digit VID ('9146 3489 2265 9361') — the plain 12-digit
+# pattern matched its first three groups, so whenever the real number was
+# masked or unreadable the VID was silently returned as the Aadhaar number.
+AADHAAR_PATTERN = (r"(?<!\d)(?<!\d[ \t])\d{4}\s?\d{4}\s?\d{4}"
+                   r"(?![ \t]?\d)")
+
+# Issuer-masked Aadhaar ('XXXX XXXX 4270' — the "masked Aadhaar" UIDAI /
+# DigiLocker hand out). Only the last 4 digits are printed.
+_MASK_CH = r"[X×*•#]"
+MASKED_AADHAAR_PATTERN = (rf"(?<![A-Z0-9]){_MASK_CH}{{4}}[ \t]?{_MASK_CH}{{4}}"
+                          r"[ \t]?(\d{4})(?![ \t]?\d)")
+_MASK_PREFIX_RX = re.compile(rf"^\W*{_MASK_CH}{{4}}\s?{_MASK_CH}{{4}}\W*$",
+                             re.I)
+
+
+def find_masked_aadhaar(regions: List[Dict]) -> Tuple[str, float, List[Dict]]:
+    """Locate an issuer-masked Aadhaar number.
+
+    Returns ``(last4, confidence, regions_holding_it)`` or ``("", 0.0, [])``.
+    Handles the masked groups and the last 4 digits landing in one OCR
+    region ('XXXX XXXX 4270') or in two side-by-side regions ('XXXX XXXX' |
+    '4270') — the detector often splits on the wider gap."""
+    rx = re.compile(MASKED_AADHAAR_PATTERN, re.I)
+    for r in regions:
+        m = rx.search(r["text"])
+        if m:
+            return m.group(1), r["conf"], [r]
+    for r in regions:
+        if not _MASK_PREFIX_RX.match(r["text"].strip()):
+            continue
+        x1, y1, x2, y2 = r["region"].bbox
+        h = max(y2 - y1, 1)
+        for o in regions:
+            if o is r or not re.fullmatch(r"\d{4}", o["text"].strip()):
+                continue
+            ox1, oy1, ox2, oy2 = o["region"].bbox
+            overlap = min(y2, oy2) - max(y1, oy1)
+            if overlap >= 0.5 * min(h, oy2 - oy1) and x2 - h <= ox1 <= x2 + 3 * h:
+                return o["text"].strip(), min(r["conf"], o["conf"]), [r, o]
+    return "", 0.0, []
+
+
+# Pre-2015 state-format driving licence number: an optional 'DLF' prefix, a
+# state code and a 12-digit run — e.g. Andhra Pradesh 'DLFAP025184122010'.
+# The modern 2+13 pattern can't match it (12 digits, not 13), and the bare
+# 12-digit tail otherwise reads as an Aadhaar number, so the card was
+# classified AADHAAR. Anchored to real state codes so an arbitrary
+# '<2 letters><12 digits>' OCR glue (e.g. 'NO123456789012') can't match.
+_DL_STATE_CODES = (
+    "AN|AP|AR|AS|BR|CG|CH|DD|DL|DN|GA|GJ|HP|HR|JH|JK|KA|KL|LA|LD|MH|ML|MN|"
+    "MP|MZ|NL|OD|OR|PB|PY|RJ|SK|TN|TR|TS|UA|UK|UP|WB")
+DL_LEGACY_PATTERN = rf"(?:DLF)?(?:{_DL_STATE_CODES})[\s-]?\d{{12}}(?!\d)"
 
 
 # Common Indian surnames — used to recover the first/last-name boundary
@@ -497,6 +567,18 @@ def _aadhaar_name(ordered: List[Dict]) -> Tuple[str, float]:
     dob_idx = next((i for i, r in enumerate(ordered)
                     if _DOB_ANCHOR_RX.search(r["text"])), -1)
     if dob_idx > 0:
+        # Same column first. On a multi-panel layout (e-Aadhaar letter:
+        # front and back printed side by side) reading order interleaves the
+        # other panel's lines — there a Tamil address line misread as
+        # 'GFGULD,' sat between the English name and the DOB line and was
+        # taken as the name. Require horizontal overlap with the DOB line.
+        dx1, _, dx2, _ = ordered[dob_idx]["region"].bbox
+        for j in range(dob_idx - 1, -1, -1):
+            x1, _, x2, _ = ordered[j]["region"].bbox
+            if min(x2, dx2) - max(x1, dx1) <= 0:
+                continue
+            if _looks_like_aadhaar_name(ordered[j]["text"]):
+                return _clean_name(ordered[j]["text"]), ordered[j]["conf"]
         for j in range(dob_idx - 1, -1, -1):
             if _looks_like_aadhaar_name(ordered[j]["text"]):
                 return _clean_name(ordered[j]["text"]), ordered[j]["conf"]
@@ -921,9 +1003,16 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     ordered = _order(regions)
 
     # ── front-side signals (identity) ──
-    num_match = re.search(r"(?<!\d)(\d{4}\s?\d{4}\s?\d{4})(?!\d)", full_text)
-    aadhaar_num = re.sub(r"\s+", "", num_match.group(1)) if num_match else ""
+    num_match = re.search(AADHAAR_PATTERN, full_text)
+    aadhaar_num = re.sub(r"\s+", "", num_match.group(0)) if num_match else ""
     a_conf = _conf_for(regions, aadhaar_num)
+    # Issuer-masked card: only the last 4 digits are printed. Report them
+    # as 'XXXXXXXX1234' with is_masked=True instead of an empty number.
+    is_masked = False
+    if not aadhaar_num:
+        last4, m_conf, _ = find_masked_aadhaar(regions)
+        if last4:
+            aadhaar_num, a_conf, is_masked = "XXXXXXXX" + last4, m_conf, True
 
     # _aadhaar_dob returns the raw matched date so the confidence lookup lands
     # on the real birth-date region, not a stray print/issue date.
@@ -961,8 +1050,9 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     has_front = bool(dob_val or gender)
     has_back = bool(addr)
 
+    # A masked number isn't unique — don't hash it into a fake identity.
     uniq = (hashlib.sha256(aadhaar_num.encode()).hexdigest()
-            if aadhaar_num else "")
+            if aadhaar_num and not is_masked else "")
 
     front_obj = {
         "document_type": "aadhaar_front_bottom",
@@ -973,7 +1063,7 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
         "dob": {"value": dob_val, "confidence": _conf(dob_conf),
                 "yob": yob_only},
         "aadhaar_number": {"value": aadhaar_num, "confidence": _conf(a_conf),
-                           "is_masked": False, "input_validation": False},
+                           "is_masked": is_masked, "input_validation": False},
         "image_url": None,
         "uniqueness_id": uniq,
     }
@@ -985,7 +1075,7 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
         "care_of": {"value": care_of, "confidence": _conf(addr_conf),
                     "relation": co_relation},
         "aadhaar_number": {"value": aadhaar_num, "confidence": _conf(a_conf),
-                           "is_masked": False, "input_validation": False},
+                           "is_masked": is_masked, "input_validation": False},
         "image_url": None,
     }
 
@@ -1320,7 +1410,23 @@ def build_passport(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 # Driving License
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
+def _dl_issue_year(license_num: str) -> int:
+    """Issue year encoded in a DL number, or 0 when it can't be read.
+
+    Modern format 'SS RR YYYY NNNNNNN' carries it after the RTO code; the
+    legacy 12-digit state format ('DLFAP025184122010') ends with it."""
+    digits = re.sub(r"\D", "", license_num)
+    if len(digits) == 13:
+        year = int(digits[2:6])
+    elif len(digits) == 12:
+        year = int(digits[-4:])
+    else:
+        return 0
+    return year if 1950 <= year <= date.today().year else 0
+
+
+def _license_dob(full_text: str, regions: List[Dict],
+                 issue_year: int = 0) -> Tuple[str, float]:
     """Return (YYYY-MM-DD, confidence) for a Driving Licence's DOB.
 
     DOB is a required field. A DL prints it alongside the issue and
@@ -1351,6 +1457,10 @@ def _license_dob(full_text: str, regions: List[Dict]) -> Tuple[str, float]:
         if not iso:
             continue
         if issue_rx.search(full_text[max(0, mm.start() - 30):mm.start()]):
+            continue
+        # A holder is at least 16 when the licence is issued, so a date that
+        # late is the (unlabelled / misread) issue date, never the DOB.
+        if issue_year and int(iso[:4]) > issue_year - 16:
             continue
         dated.append((iso, mm.group(0)))
     if dated:
@@ -1390,7 +1500,10 @@ _DL_VALUE_NOISE = re.compile(
     r"DLNUMBER|\bDL\s*NO|INV|CARR|VALIDITY|\bVALID\b|FORM|RULE|AUTHORIS|"
     r"AADHAAR|ISSUING|AUTHORITY|HOLDER|SIGNATURE|\bAUTH\b|DRIVE|\bCOV\b|"
     r"\bLMV\b|\bMCWG\b|UNION|STATE\s*MOTOR|BLOOD|\bDOB\b|\bBG\b|\bNAME\b|"
-    r"DATE\s*OF|ISSUE|THUMB|IMPRESSION|BADGE",
+    r"DATE\s*OF|ISSUE|THUMB|IMPRESSION|BADGE|"
+    # Card heading ('Driving Licence' / misread 'Drving Licence') printed in
+    # the label column, and stock-photo watermarks over sample cards.
+    r"DR[IV]*NG|LICEN|GETTY|SHUTTERSTOCK|ALAMY|CREDIT",
     re.I,
 )
 
@@ -1511,9 +1624,10 @@ def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
     first name-like value at/below the NAME label as the holder, then the
     next name-like value below it as the guardian. The glued single-region
     layout some states print ('S/DWOfMILIND') is honoured first."""
-    name_lbl = _dl_find_label(regions, r"\bNAME\b")
+    # RC cards print 'Maker's Name' / 'Model Name' — vehicle, not holder.
+    name_lbl = _dl_find_label(regions, r"^(?!.*(?:MAKER|MODEL)).*\bNAME\b")
     swd_lbl = _dl_find_label(
-        regions, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b")
+        regions, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b|\bSON\s*/\s*WIFE\s*/\s*DAUGHTER\s*OF(?:\s*\([^)]*\)?)?")
 
     def _glued(label, cleaner, rx):
         if label is None:
@@ -1526,7 +1640,7 @@ def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
 
     name_v, name_c = _glued(name_lbl, _clean_name, r"\bNAME\b")
     swd_v, swd_c = _glued(
-        swd_lbl, _clean_swd, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b")
+        swd_lbl, _clean_swd, r"\bS[WD]?\s*/\s*[DWMO]|\b[WD]\s*/\s*O\b|\bSON\s*/\s*WIFE\s*/\s*DAUGHTER\s*OF(?:\s*\([^)]*\)?)?")
 
     def _cx(r):
         b = r["region"].bbox
@@ -1540,10 +1654,14 @@ def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
     cands: List[Dict] = []
     if ref is not None:
         rcx = _cx(ref)
+        # A value starts to the right of the label column. Testing the
+        # value's LEFT edge (not its centre) keeps out other wide labels in
+        # that column — 'Driving Licence', 'Fathor' — whose centre merely
+        # sits right of a short 'Name' label's centre.
         cands = sorted(
             (o for o in regions
              if o not in (name_lbl, swd_lbl)
-             and _cx(o) > rcx
+             and o["region"].bbox[0] > rcx
              and _dl_is_name_value(o["text"].strip())),
             key=_cy)
 
@@ -1560,6 +1678,35 @@ def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
             name_v, name_c = _clean_name(pick["text"].strip()), pick["conf"]
             name_y = _cy(pick)
 
+    # Stacked layout (Vehicle RC cards): each value is printed directly
+    # UNDER its label, left-aligned with it ('Owner Name' / 'JAY VERMA' /
+    # 'Son/Wife/Daughter of ...' / 'SUKESH VERMA'), so there's no value
+    # column to the right of the labels.
+    def _below(label):
+        lb = label["region"].bbox
+        lh = max(lb[3] - lb[1], 1)
+        for o in sorted(regions, key=lambda r: r["region"].bbox[1]):
+            ob = o["region"].bbox
+            if o is label or ob[1] < lb[3] - 0.3 * lh:
+                continue
+            if ob[1] - lb[3] > 1.5 * lh:
+                break
+            if (abs(ob[0] - lb[0]) <= 1.5 * lh
+                    and _dl_is_name_value(o["text"].strip())):
+                return o
+        return None
+
+    if not name_v and name_lbl is not None:
+        pick = _below(name_lbl)
+        if pick is not None:
+            name_v, name_c = _clean_name(pick["text"].strip()), pick["conf"]
+            if not swd_v and swd_lbl is not None:
+                spick = _below(swd_lbl)
+                if spick is not None:
+                    swd_v = _clean_swd(spick["text"].strip())
+                    swd_c = spick["conf"]
+            return name_v, name_c, swd_v, swd_c
+
     if not swd_v and cands:
         # The guardian name is the next name-like value below the holder.
         if name_y is not None:
@@ -1574,6 +1721,44 @@ def _license_names(regions: List[Dict]) -> Tuple[str, float, str, float]:
             swd_v, swd_c = _clean_swd(pick["text"].strip()), pick["conf"]
 
     return name_v, name_c, swd_v, swd_c
+
+
+def _dl_unlabelled_block(regions: List[Dict], license_raw: str) -> List[Dict]:
+    """Lines printed straight under the licence number with no labels.
+
+    Older state cards (e.g. Andhra Pradesh 'DLFAP025184122010') print the
+    holder name, the S/W/D name and the address as a bare left-aligned
+    column below the number: 'AKHIL S' / 'ASHOK' / '7-34' / 'RUDRUR' / ...
+    Returns that column top-down, stopping at a large vertical gap or a
+    signature / authority / date marker."""
+    key = re.sub(r"[^A-Z0-9]", "", license_raw.upper())
+    if not key:
+        return []
+    anchor = next((r for r in regions
+                   if key in re.sub(r"[^A-Z0-9]", "", r["text"].upper())),
+                  None)
+    if anchor is None:
+        return []
+    ax1, ay1, ax2, ay2 = anchor["region"].bbox
+    ah = max(ay2 - ay1, 1)
+    col = sorted(
+        (o for o in regions
+         if o is not anchor
+         and abs(o["region"].bbox[0] - ax1) <= max(1.5 * ah, 0.12 * (ax2 - ax1))
+         and o["region"].bbox[1] >= ay1 + 0.5 * ah),
+        key=lambda o: o["region"].bbox[1])
+    out: List[Dict] = []
+    prev_y2 = ay2
+    for o in col:
+        x1, y1, x2, y2 = o["region"].bbox
+        t = o["text"].strip()
+        if y1 - prev_y2 > 1.5 * ah:
+            break
+        if _DL_ADDR_STOP.search(t) or _to_iso_date(t):
+            break
+        out.append(o)
+        prev_y2 = y2
+    return out
 
 
 def _license_address(regions: List[Dict]) -> Tuple[str, float]:
@@ -1692,6 +1877,12 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     lm = re.search(r"([A-Z]{2}[\s-]?\d{2}[\s-]?\d{11})", up)
     license_raw = lm.group(1) if lm else ""
 
+    # Older state-format number — e.g. AP 'DLFAP025184122010'.
+    if not license_raw:
+        om = re.search(DL_LEGACY_PATTERN, up)
+        if om:
+            license_raw = om.group(0)
+
     # Vehicle Registration Certificate fallback — e.g. 'CH01CY1547'.
     if not license_raw:
         rcm = re.search(
@@ -1706,7 +1897,8 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     # wants those stripped so the value is a single concatenated token.
     license_num = re.sub(r"[^A-Z0-9]", "", license_raw)
 
-    dob_val, dob_conf = _license_dob(full_text, regions)
+    dob_val, dob_conf = _license_dob(full_text, regions,
+                                     _dl_issue_year(license_num))
 
     # ── label-anchored card fields (name / guardian / blood group / address
     #    / issue date) — robust to both the separate-region layout (HR-style:
@@ -1720,6 +1912,37 @@ def build_license(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     address_val, addr_conf = _license_address(regions)
 
     issue_val, issue_conf = _license_issue_date(regions, dob_val)
+
+    # No NAME / S/W/D / Address labels at all — an older unlabelled layout.
+    # Read the bare column under the licence number instead: holder name,
+    # then guardian name, then the address lines.
+    if not (name_val or swd_val or address_val):
+        block = _dl_unlabelled_block(regions, license_raw)
+        names = []
+        while block and len(names) < 2 and _dl_is_name_value(block[0]["text"]):
+            names.append(block.pop(0))
+        if names:
+            name_val = _clean_name(names[0]["text"].strip())
+            name_conf = names[0]["conf"]
+        if len(names) > 1:
+            swd_val = _clean_name(names[1]["text"].strip())
+            swd_conf = names[1]["conf"]
+        lines = [o for o in block if _dl_is_addr_value(o["text"])
+                 or re.fullmatch(r"[\d/\-]{2,}", o["text"].strip())]
+        if lines and names:
+            address_val = ", ".join(o["text"].strip() for o in lines)
+            addr_conf = min(o["conf"] for o in lines)
+
+    # The label was lost to OCR ('Issued on' read as 'ignatu'): the number
+    # encodes the issue year, so an unlabelled date in that year is the
+    # issue date.
+    issue_year = _dl_issue_year(license_num)
+    if not issue_val and issue_year:
+        for mm in re.finditer(r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}", full_text):
+            iso = _to_iso_date(mm.group(0))
+            if iso and iso != dob_val and int(iso[:4]) == issue_year:
+                issue_val, issue_conf = iso, _conf_for(regions, mm.group(0))
+                break
 
     data = {
         "document_type": None,
@@ -1780,8 +2003,11 @@ def _build_voter_front(regions: List[Dict], full_text: str,
     # actual date.
     dob_val = ""
     dob_conf = 0.0
+    # 'DATE OF' / 'AGE' alone are enough to anchor it: on small or soft
+    # photos 'BIRTH' is routinely misread ('DATEOFBITH/AGE:20-09-2005'),
+    # which left the DOB to be picked up as the card date instead.
     dm = re.search(
-        r"(?:DOB|DATE\s*OF\s*BIRTH|BIRTH)[^\d]{0,20}"
+        r"(?:DOB|DATE\s*OF|BIRTH|AGE)[^\d]{0,20}"
         r"([0-3]?\d[/\-.][01]?\d[/\-.]\d{4})",
         full_text, re.I,
     )
@@ -1797,6 +2023,32 @@ def _build_voter_front(regions: List[Dict], full_text: str,
         gender = {"male": "M", "female": "F",
                   "transgender": "T"}[gm.group(1).lower()]
         g_conf = _conf_for(regions, gm.group(1))
+    else:
+        # The value is often glued to its label and the regional-script
+        # transliteration, with L read as I/1 ('GENDERAYFEMAIE'). Look only
+        # at what follows the GENDER/SEX label, so fuzzy matching can't fire
+        # on unrelated text. FEMALE is tried first — it contains MALE.
+        # The value may also sit in its own region right of the label
+        # ('/Sex' | 'gw/Mae'), and the L is sometimes dropped ('Mae').
+        for i, r in enumerate(ordered):
+            lm = re.search(r"(?:GEND[EO]R|SEX)(.*)", r["text"], re.I)
+            if not lm:
+                continue
+            tails = [(lm.group(1), r["conf"])]
+            if i + 1 < len(ordered):
+                tails.append((ordered[i + 1]["text"], ordered[i + 1]["conf"]))
+            for tail, conf in tails:
+                tail = tail.upper()
+                for rx, code in ((r"TRANS", "T"),
+                                 (r"F[E3]MA[LI1|]?E", "F"),
+                                 (r"MA[LI1|]?E", "M")):
+                    if re.search(rx, tail):
+                        gender, g_conf = code, conf
+                        break
+                if gender:
+                    break
+            if gender:
+                break
 
     # Age — never read off the card; compute it from the DOB so it stays
     # current. Confidence mirrors the DOB it was derived from.
@@ -1815,6 +2067,11 @@ def _build_voter_front(regions: List[Dict], full_text: str,
             r"(?:FATHER|HUSBAND|MOTHER)(?:['’]?S)?\s*NAME"
             r"\s*[:/.\-]?\s*(\S.*)",
             r["text"], re.I,
+        ) or re.search(
+            # Misread label ("MOTHOR'AMAME:GEETHA"): relation stem, a
+            # short garbled run ending in 'ME', then a colon.
+            r"(?:FATH|HUSB|MOTH)[A-Z'’ ]{0,8}?ME\s*:\s*(\S.*)",
+            r["text"], re.I,
         )
         if cm and cm.group(1).strip():
             care_of = _clean_name(cm.group(1))
@@ -1828,9 +2085,12 @@ def _build_voter_front(regions: List[Dict], full_text: str,
     name_conf = 0.0
     for r in ordered:
         t = r["text"].strip()
-        if re.search(r"FATHER|HUSBAND|MOTHER", t, re.I):
+        if re.search(r"FATH|HUSB|MOTH", t, re.I):
             continue
-        nm = re.search(r"\bNAME\s*[:/.\-]?\s*(\S.*)", t, re.I)
+        # 'ELECTOR'SNAME:PREMRAJTHAKUR' — the OCR glues the label, so
+        # there's no word boundary before NAME.
+        nm = re.search(r"(?:\b|ELECTOR['’]?S\s*)NAME\s*[:/.\-]?\s*(\S.*)",
+                       t, re.I)
         if nm and nm.group(1).strip():
             full_name = _clean_name(nm.group(1))
             name_conf = r["conf"]
@@ -1881,8 +2141,10 @@ def build_voter(regions: List[Dict], full_text: str) -> Dict[str, Any]:
     """Route by side: 'Address' without EPIC/elector signals → back."""
     ordered = _order(regions)
     up = full_text.upper()
+    # 'ELECTOR(?!AL)': the back's 'Electoral Registration Officer' line
+    # contains ELECTOR and otherwise routed every back to the front parser.
     is_back = ("ADDRESS" in up
-               and not re.search(r"ELECTOR|EPIC|PHOTO\s*IDENTITY", up))
+               and not re.search(r"ELECTOR(?!AL)|EPIC|PHOTO\s*IDENTITY", up))
     if is_back:
         return _build_voter_back(regions, full_text, ordered)
     return _build_voter_front(regions, full_text, ordered)

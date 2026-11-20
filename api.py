@@ -50,6 +50,27 @@ log = logging.getLogger("uvicorn.error")
 # Uploads larger than this are rejected with 413 before any decoding.
 MAX_UPLOAD_BYTES = _env_int("KYC_MAX_UPLOAD_MB", 25) * 1024 * 1024
 
+# Server-side deadlines. Each sits just below its CALLER's HTTP timeout, so a
+# request that would have been cut by the client comes back as an explicit
+# 504 `error_code: "timeout"` it can count separately, instead of a dropped
+# connection that looks like an OCR failure. Never set one above its
+# caller's budget's reach for normal documents: a deadline that fires on a
+# request the caller would still have waited for turns a slow success into a
+# guaranteed failure on every retry. 0 disables. The OCR thread itself can't
+# be interrupted — it finishes in the background; only the response is cut.
+#
+# OCR extraction (/ocr, /ocr/<doc>): callers give it 30 s.
+REQUEST_TIMEOUT_SEC = _env_int("KYC_REQUEST_TIMEOUT_SEC", 25)
+# /mask-identity: recriauth gives masking 120 s — heavy masks (a full
+# e-Aadhaar letter page) routinely exceed 30 s, plus time queued for a mask
+# slot, which this deadline also covers. 110 s returns a clean 504 before
+# the caller's 120 s cut without ever pre-empting a mask it would wait for.
+MASK_TIMEOUT_SEC = _env_int("KYC_MASK_TIMEOUT_SEC", 110)
+# /ocr/pdf-pages: recriauth gives full-page reads 120 s — two A4 pages plus
+# time queued for the one-at-a-time pdf-pages slot, which this deadline also
+# covers. Same 110 s reasoning as masking.
+PDF_PAGES_TIMEOUT_SEC = _env_int("KYC_PDF_PAGES_TIMEOUT_SEC", 110)
+
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
 
 # The /api/v1/ocr/mask-identity contract uses lower-case, hyphenated document types.
@@ -189,25 +210,49 @@ async def _upload_to_tempfile(file: UploadFile) -> AsyncIterator[str]:
             os.remove(path)
 
 
-def _error(message: str, status: int) -> JSONResponse:
-    return JSONResponse(content=failure_envelope(message, status=status),
-                        status_code=status)
+def _error(message: str, status: int,
+           error_code: str = "failed") -> JSONResponse:
+    return JSONResponse(
+        content=failure_envelope(message, status=status,
+                                 error_code=error_code),
+        status_code=status)
 
 
-async def _guarded(coro_fn, file: UploadFile, *args):
+async def _guarded(coro_fn, file: UploadFile, *args,
+                   slots: Optional[asyncio.Semaphore] = None,
+                   timeout: Optional[int] = None):
     """Run a pipeline entry point on the uploaded file, mapping bad input to
-    4xx and anything unexpected to a logged 500 in the standard envelope
-    (instead of FastAPI's bare-text 500)."""
-    try:
+    4xx, the deadline to 504 and anything unexpected to a logged 500 in the
+    standard envelope (instead of FastAPI's bare-text 500). ``slots`` (a
+    concurrency cap) is acquired inside the deadline, so queueing time counts
+    toward it. ``timeout`` defaults to REQUEST_TIMEOUT_SEC (read at call
+    time); 0 disables."""
+    limit = REQUEST_TIMEOUT_SEC if timeout is None else timeout
+    async def _run():
         async with _upload_to_tempfile(file) as path:
-            return await coro_fn(path, *args)
+            if slots is None:
+                return await coro_fn(path, *args)
+            async with slots:
+                return await coro_fn(path, *args)
+
+    try:
+        if limit > 0:
+            return await asyncio.wait_for(_run(), limit)
+        return await _run()
+    except asyncio.TimeoutError:
+        log.warning("request exceeded %ss deadline (%s)",
+                    limit, getattr(coro_fn, "__name__", "?"))
+        return _error(
+            f"Processing exceeded {limit}s — server busy or "
+            "document too dense; retry", 504, "timeout")
     except _UploadError as e:
-        return _error(str(e), e.status)
+        return _error(str(e), e.status, "invalid_upload")
     except DocumentLoadError as e:        # undecodable image / PDF
-        return _error(str(e), 422)
+        return _error(str(e), 422, e.code)
     except Exception:
         log.exception("pipeline failed")
-        return _error("Internal error while processing the document", 500)
+        return _error("Internal error while processing the document", 500,
+                      "internal_error")
 
 
 async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
@@ -219,7 +264,8 @@ async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
     payload = result.get("output_json")
     if payload is None:
         payload = failure_envelope(
-            result.get("message") or "processing failed")
+            result.get("message") or "processing failed",
+            error_code="internal_error")
 
     return JSONResponse(
         content=payload,
@@ -283,12 +329,13 @@ async def mask_identity_endpoint(
     if internal is None:
         return JSONResponse(
             content=failure_envelope(
-                f"Unsupported document_type: {document_type}", status=400),
+                f"Unsupported document_type: {document_type}", status=400,
+                error_code="invalid_upload"),
             status_code=400,
         )
 
-    async with _mask_slots:
-        result = await _guarded(_pipeline.mask_identity, file, internal)
+    result = await _guarded(_pipeline.mask_identity, file, internal,
+                            slots=_mask_slots, timeout=MASK_TIMEOUT_SEC)
     if isinstance(result, JSONResponse):
         return result
 
@@ -296,10 +343,12 @@ async def mask_identity_endpoint(
     # encode error). 4xx = permanent (don't retry), 5xx = transient.
     if result.get("unmasked_image") is None:
         status = result.get("status", 422)
+        code = {400: "invalid_upload", 503: "ocr_unavailable",
+                500: "internal_error"}.get(status, "failed")
         return JSONResponse(
             content=failure_envelope(
                 result.get("message") or "document processing failed",
-                status=status),
+                status=status, error_code=code),
             status_code=status,
         )
 
@@ -313,6 +362,9 @@ async def mask_identity_endpoint(
                          if masked is not None else None),
         "mime_type": "image/png",
         "document_detected": result["document_detected"],
+        # True for an issuer-masked Aadhaar ('XXXX XXXX 1234'): nothing needed
+        # redacting, masked_image is the document as uploaded (cropped).
+        "already_masked": result.get("already_masked", False),
         "masked_regions": result["masked_regions"],
         "message": result.get("message"),
         "client_id": client_id,
@@ -351,8 +403,8 @@ async def pdf_pages_endpoint(
         except PdfPagesError as e:
             return _error(str(e), e.status)
 
-    async with _pdf_pages_slots:
-        result = await _guarded(_read, file)
+    result = await _guarded(_read, file, slots=_pdf_pages_slots,
+                            timeout=PDF_PAGES_TIMEOUT_SEC)
     if isinstance(result, JSONResponse):
         return result
     return JSONResponse(content=success_envelope(result), status_code=200)

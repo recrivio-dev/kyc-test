@@ -498,9 +498,30 @@ unavailable, the same envelope is returned with a populated `message`:
   "status_code": 400,
   "message_code": "failed",
   "message": "Expected PASSPORT, got UNKNOWN",
-  "success": false
+  "success": false,
+  "error_code": "document_mismatch"
 }
 ```
+
+`message_code` stays `"failed"` for compatibility; `error_code` says why, so
+genuine OCR misses can be counted apart from bad uploads and timeouts:
+
+| `error_code`         | HTTP | Meaning |
+| -------------------- | ---- | ------- |
+| `document_mismatch`  | 400  | Image is a different document type than requested |
+| `id_not_found`       | 400  | Right document, ID number not read — the genuine OCR failure |
+| `invalid_upload`     | 400/413 | Empty / oversized file, bad `document_type` |
+| `unreadable_file`    | 422  | Not a decodable image / PDF |
+| `password_protected` | 422  | Encrypted PDF (UIDAI e-Aadhaar download) |
+| `timeout`            | 504  | Exceeded the server deadline — `KYC_REQUEST_TIMEOUT_SEC` (OCR, default 25 s), `KYC_MASK_TIMEOUT_SEC` (`/mask-identity`, default 110 s, incl. mask-queue wait) or `KYC_PDF_PAGES_TIMEOUT_SEC` (`/ocr/pdf-pages`, default 110 s, incl. queue wait). Keep each below its caller's HTTP timeout — retryable |
+| `ocr_unavailable`    | 503  | Models not loaded — retryable |
+| `internal_error`     | 500  | Unexpected exception — retryable |
+
+**Issuer-masked Aadhaar** (`XXXX XXXX 1234`, e.g. the DigiLocker / UIDAI
+masked download) is a success, not a failure: `aadhaar_number.value` is
+`XXXXXXXX1234` with `is_masked: true`, and `/mask-identity` returns
+`already_masked: true` with the document as-is (any printed 16-digit VID is
+still redacted).
 
 ---
 

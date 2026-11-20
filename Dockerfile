@@ -82,8 +82,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 COPY --chown=app:app api.py config.py kyc_pipeline.py layout_detector.py \
-                     ocr_engines.py output_schema.py preprocessing.py \
-                     gunicorn_conf.py /app/
+                     ocr_engines.py output_schema.py pdf_pages.py \
+                     preprocessing.py gunicorn_conf.py /app/
 
 RUN mkdir -p /cache/huggingface /cache/torch /app/sample-docs \
  && chown -R app:app /cache /app/sample-docs

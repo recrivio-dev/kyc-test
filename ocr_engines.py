@@ -14,6 +14,7 @@ word-level text recognition (see layout_detector.py / kyc_pipeline.py).
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -29,6 +30,10 @@ class OCRWordBox:
     text: str
     bbox: Tuple[int, int, int, int]        # (x1, y1, x2, y2)
     confidence: Optional[float] = None
+    # Angle-classifier verdict for this line ("0" / "180") and its score.
+    # Only populated by RapidOCREngine.read().
+    cls_label: str = "0"
+    cls_score: float = 0.0
 
 
 @dataclass
@@ -65,13 +70,115 @@ class OCREngine:
 
 class RapidOCREngine(OCREngine):
 
-    def __init__(self, lang: str = "en"):
+    # RapidOCR drops any line whose recognition score is below this gate.
+    TEXT_SCORE = 0.5
+
+    def __init__(self, lang: str = "en", threads: int = 0,
+                 det_max_side: int = 0, rec_model_path: str = "",
+                 rec_keys_path: str = ""):
+        """``threads`` — ONNX Runtime intra-op threads per session (0 = ORT
+        default, i.e. one per physical core). ``det_max_side`` — cap the
+        longest side the *detector* sees (0 = RapidOCR default). Recognition
+        always crops from the full-resolution image, so lowering the detector
+        resolution speeds up the dominant cost without blurring the glyphs
+        the recogniser reads."""
         from rapidocr_onnxruntime import RapidOCR
 
         self.name = "rapidocr"
         self.lang = lang
-        # First construction downloads/loads the ONNX models once.
-        self.engine = RapidOCR()
+        kwargs = {}
+        if threads > 0:
+            kwargs["intra_op_num_threads"] = threads
+            kwargs["inter_op_num_threads"] = 1
+        # Swap the recognition model (e.g. an English/Latin one); keys_path is
+        # only needed when the model doesn't embed its character list.
+        if rec_model_path:
+            kwargs["rec_model_path"] = rec_model_path
+        if rec_keys_path:
+            kwargs["rec_keys_path"] = rec_keys_path
+        # First construction loads the ONNX models once.
+        self.engine = RapidOCR(**kwargs)
+        if det_max_side > 0:
+            from rapidocr_onnxruntime.ch_ppocr_det.utils import DetPreProcess
+            det = self.engine.text_det
+            det.get_preprocess = lambda _max_wh: DetPreProcess(
+                det_max_side, "max", det.mean, det.std)
+
+    def _detect_boxes(self, img, box_thresh: float = 0.0):
+        """RapidOCR's detection step, optionally with a per-call box
+        threshold. The override runs on a shallow copy of the detector so
+        concurrent requests sharing this engine never see each other's
+        threshold."""
+        det = self.engine.text_det
+        if box_thresh > 0:
+            det = copy.copy(det)
+            det.postprocess_op = copy.copy(det.postprocess_op)
+            det.postprocess_op.box_thresh = box_thresh
+        dt_boxes, _ = det(img)
+        if dt_boxes is None or len(dt_boxes) < 1:
+            return None
+        return self.engine.sorted_boxes(dt_boxes)
+
+    def read(self, image, box_thresh: float = 0.0) -> List[OCRWordBox]:
+        """One fused detect → angle-classify → recognise pass that returns
+        EVERY detected line, including the ones RapidOCR's own ``__call__``
+        would silently drop below ``TEXT_SCORE``, together with each line's
+        angle-class verdict.
+
+        Returning the sub-gate lines lets the caller re-read them (see
+        kyc_pipeline._recover_dropped_lines) without a second detection
+        pass, and the per-line angle class doubles as a free orientation
+        check. Uses RapidOCR's own stage objects, so boxes, crops and
+        ordering are identical to ``engine(image)``."""
+        eng = self.engine
+        raw_h, raw_w = image.shape[:2]
+        img, ratio_h, ratio_w = eng.preprocess(image)
+        op_record = {"preprocess": {"ratio_h": ratio_h, "ratio_w": ratio_w}}
+        img, op_record = eng.maybe_add_letterbox(img, op_record)
+        dt_boxes = self._detect_boxes(img, box_thresh)
+        if dt_boxes is None:
+            return []
+        crops = eng.get_crop_img_list(img, dt_boxes)
+        crops, cls_res, _ = eng.text_cls(crops)
+        rec_res, _ = eng.text_rec(crops)
+        quads = eng._get_origin_points(dt_boxes, op_record, raw_h, raw_w)
+        return [
+            OCRWordBox(rec[0], _poly_to_xyxy(quad), float(rec[1]),
+                       str(cls[0]), float(cls[1]))
+            for quad, cls, rec in zip(quads, cls_res, rec_res)
+        ]
+
+    def probe_orientation(self, image) -> List[Tuple[float, float, str, float]]:
+        """Detection + angle-class only (no recognition) — the cheap
+        orientation probe. Returns ``(width, height, cls_label, cls_score)``
+        per detected line, where width/height are the line quad's own side
+        lengths *before* RapidOCR stands tall crops upright (it rotates any
+        crop with h/w >= 1.5 by 90° counter-clockwise before classifying)."""
+        eng = self.engine
+        img, _, _ = eng.preprocess(image)
+        img, _ = eng.maybe_add_letterbox(img, {})
+        dt_boxes, _ = eng.auto_text_det(img)
+        if dt_boxes is None:
+            return []
+        crops = eng.get_crop_img_list(img, dt_boxes)
+        _, cls_res, _ = eng.text_cls(crops)
+        out = []
+        for box, cls in zip(dt_boxes, cls_res):
+            w = float(max(np.linalg.norm(box[0] - box[1]),
+                          np.linalg.norm(box[2] - box[3])))
+            h = float(max(np.linalg.norm(box[0] - box[3]),
+                          np.linalg.norm(box[1] - box[2])))
+            out.append((w, h, str(cls[0]), float(cls[1])))
+        return out
+
+    def recognize(self, crops) -> List[Tuple[str, float]]:
+        """Angle-classify + recognise already-cropped single lines in one
+        batched call (detection OFF). Returns ``(text, score)`` per crop."""
+        if not crops:
+            return []
+        crops, _, _ = self.engine.text_cls(list(crops))
+        rec_res, _ = self.engine.text_rec(crops)
+        return [(r[0], float(r[1])) for r in rec_res]
 
     def extract(self, image) -> OCRResult:
         """Full detect + recognize. On a tiny crop this is effectively a
@@ -100,34 +207,6 @@ class RapidOCREngine(OCREngine):
             image, use_det=True, use_cls=False, use_rec=False
         )
         return [_poly_to_xyxy(box) for box in (result or [])]
-
-    def extract_rec_only(self, image) -> OCRResult:
-        """Recognise an already-cropped single text line — detection OFF.
-
-        The caller supplies a crop that already bounds one text line, so
-        the detector is skipped entirely (`use_det=False`). This is the
-        recovery path for lines the full detect+recognise pass dropped:
-        RapidOCR's detector sometimes hands the recogniser a clipped quad,
-        the recogniser then scores it below RapidOCR's internal
-        `text_score` gate (0.5), and the whole line is silently discarded.
-        Re-recognising the padded crop with detection off reads it cleanly
-        (a tight DOB date is a frequent victim of this).
-        """
-        result, _ = self.engine(
-            image, use_det=False, use_cls=True, use_rec=True
-        )
-        texts, confs = [], []
-        for item in (result or []):
-            # With detection off RapidOCR yields [text, score] pairs.
-            txt, score = item[0], float(item[1])
-            texts.append(txt)
-            confs.append(score)
-        return OCRResult(
-            text=" ".join(t for t in texts if t),
-            words=[],
-            avg_confidence=(sum(confs) / len(confs) if confs else None),
-            engine="rapidocr",
-        )
 
     def extract_no_cls(self, image) -> OCRResult:
         """Extract WITHOUT the angle-class model.

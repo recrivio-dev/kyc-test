@@ -1,0 +1,24 @@
+{
+  "sample/ad1.jpeg": [{"side": "front", "full_name": "Jay Verma", "gender": "M", "dob": "2004-06-09", "aadhaar_number": "350705226263"}],
+  "sample/ad2.jpeg": [
+    {"side": "front", "full_name": "Jay Verma", "gender": "M", "dob": "2004-06-09", "aadhaar_number": "350705226263"},
+    {"side": "back", "care_of": "Sukesh Verma", "zip": "160030", "aadhaar_number": "350705226263",
+     "address": "C/O: Sukesh Verma, House No. 1437/1, Ground Floor, Sector - 30 B, VTC: Chandigarh, PO: Sector 30, Sub District: Chandigarh, District: Chandigarh, State: Chandigarh, PIN Code: 160030"}],
+  "sample/ad2.pdf": [
+    {"side": "front", "full_name": "Jay Verma", "gender": "M", "dob": "2004-06-09", "aadhaar_number": "350705226263"},
+    {"side": "back", "care_of": "Sukesh Verma", "zip": "160030", "aadhaar_number": "350705226263",
+     "address": "C/O: Sukesh Verma, House No. 1437/1, Ground Floor, Sector - 30 B, VTC: Chandigarh, PO: Sector 30, Sub District: Chandigarh, District: Chandigarh, State: Chandigarh, PIN Code: 160030"}],
+  "sample/xadb.png": [{"side": "back", "care_of": "", "zip": "395017", "aadhaar_number": "364865840480",
+     "address": "B-1203, Siddhi Ellipse, NR. Bella Casa, Althan, Surat, Surat, Gujarat - 395017"}],
+  "sample/xadf.png": [{"side": "front", "full_name": "Aryan Anand Nahata", "gender": "M", "dob": "2005-05-15", "aadhaar_number": "364865840480"}],
+  "sample-specifics/aad1.png": [{"side": "front", "full_name": "Bholanath", "gender": "M", "dob": "1976-01-01", "aadhaar_number": "865093562671"}],
+  "sample-specifics/aad2.png": [
+    {"side": "front", "full_name": "Amit Mishra", "gender": "M", "dob": "1995-07-30", "aadhaar_number": "588410163354"},
+    {"side": "back", "care_of": "Rajesh Kumar Mishra", "zip": "212601", "aadhaar_number": "588410163354",
+     "address": "S/O: Rajesh Kumar Mishra, b.2, 12 vshani p.a.c., fatehpur, Fatehpur, Fatehpur, Uttar Pradesh - 212601"}],
+  "sample-specifics/aad3.png": [{"side": "front", "full_name": "Nirupma Pushkarna", "gender": "F", "dob": "1951", "aadhaar_number": "871608138875"}],
+  "sample-specifics/aad4.png": [{"side": "front", "full_name": "Diya Vijay Gurbani", "gender": "F", "dob": "1980", "aadhaar_number": "783841015037"}],
+  "sample-specifics/ad-prod1.png": [{"side": "front", "full_name": "Sayan Pal", "gender": "M", "dob": "2003-04-12", "aadhaar_number": "557756039633"}],
+  "sample-specifics/ad-prod2.png": [{"side": "back", "care_of": "", "zip": "713205", "aadhaar_number": "557756039633",
+     "address": "2B/41, BANKIM CHANDRA AVENUE, B-ZONE DGP-5, Durgapur (m Corp.), Barddhaman, West Bengal, 713205"}]
+}

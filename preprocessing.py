@@ -266,6 +266,84 @@ def _quad_score(rect, tex: np.ndarray) -> float:
     return d_in - d_out
 
 
+def _block_color_spread(small: np.ndarray, mask: np.ndarray,
+                        block: int = 24) -> float:
+    """Spread (LAB std, summed over channels) of the mean colour of the
+    `block`-px cells lying fully inside `mask`. A printed card mixes photo,
+    blank stock and colour bands, so its cells differ a lot (>10); a desk,
+    cloth or wood-grain background repeats one texture, so its cell means are
+    near-identical (<5) however busy it looks pixel-by-pixel."""
+    h, w = mask.shape[:2]
+    gw, gh = w // block, h // block
+    if gw < 2 or gh < 2:
+        return 0.0
+    crop = (slice(0, gh * block), slice(0, gw * block))
+    lab = cv2.cvtColor(small[crop], cv2.COLOR_BGR2LAB).astype(np.float32)
+    cell_lab = cv2.resize(lab, (gw, gh), interpolation=cv2.INTER_AREA)
+    cell_cov = cv2.resize(mask[crop].astype(np.float32), (gw, gh),
+                          interpolation=cv2.INTER_AREA)
+    cells = cell_lab[cell_cov > 0.9]
+    if len(cells) < 4:
+        return 0.0
+    return float(np.sqrt((cells.std(axis=0) ** 2).sum()))
+
+
+def _expand_past_inner_frame(best, candidates, tex: np.ndarray,
+                             small: np.ndarray,
+                             min_growth: float = 1.5,
+                             min_overlap: float = 0.90,
+                             ring_density_ratio: float = 0.2,
+                             min_ring_spread: float = 8.0):
+    """Swap `best` for the largest candidate that encloses it when the ring
+    between the two looks like card, not background (see
+    detect_document_quad). Two tests, both required:
+
+      * texture — the ring is printed at >= `ring_density_ratio` of the
+        inside's density (a plain desk or soft shadow is far below);
+      * colour spread — the ring's cells vary in colour like card content
+        (`_block_color_spread`), which rejects a uniformly busy background
+        (cloth, wood grain, sensor noise) that passes the texture test."""
+    # Cheap exit before any mask work: on the common path every candidate is
+    # roughly the same card, so none is big enough to enclose the winner.
+    def _rect_area(rect) -> float:
+        return float(rect[1][0] * rect[1][1])
+
+    if not any(_rect_area(c[2]) >= min_growth * _rect_area(best[2])
+               for c in candidates):
+        return best
+
+    h, w = tex.shape[:2]
+
+    def _fill(rect) -> np.ndarray:
+        m = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(m, cv2.boxPoints(rect).astype(np.int32), 1)
+        return m
+
+    inner = _fill(best[2])
+    n_inner = int(inner.sum())
+    if n_inner == 0:
+        return best
+    d_inner = float((tex * inner).sum()) / n_inner
+
+    chosen, chosen_area = best, n_inner
+    for cand in candidates:
+        outer = _fill(cand[2])
+        n_outer = int(outer.sum())
+        if n_outer < min_growth * n_inner or n_outer <= chosen_area:
+            continue
+        if float((inner & outer).sum()) / n_inner < min_overlap:
+            continue
+        ring = outer & (1 - inner)
+        n_ring = int(ring.sum())
+        if n_ring == 0:
+            continue
+        d_ring = float((tex * ring).sum()) / n_ring
+        if (d_ring >= ring_density_ratio * d_inner
+                and _block_color_spread(small, ring) >= min_ring_spread):
+            chosen, chosen_area = cand, n_outer
+    return chosen
+
+
 def detect_document_quad(img: np.ndarray,
                          min_area_ratio: float = 0.08,
                          aspect_range: tuple = (1.10, 2.60),
@@ -285,6 +363,7 @@ def detect_document_quad(img: np.ndarray,
     frame_area = float(small.shape[0] * small.shape[1])
 
     best = None
+    candidates = []
     rejected = {}
     for name, mask in _candidate_masks(small).items():
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
@@ -307,12 +386,23 @@ def detect_document_quad(img: np.ndarray,
             rejected[name] = f"aspect {aspect:.2f}"
             continue
         score = _quad_score(rect, tex)
+        cand = (score, name, rect, area_ratio, aspect, angle)
+        candidates.append(cand)
         if best is None or score > best[0]:
-            best = (score, name, rect, area_ratio, aspect, angle)
+            best = cand
 
     if best is None:
         return None, {"reason": "no candidate passed", "rejected": rejected}
 
+    # Inner-frame guard. A framed paragraph (Aadhaar's red disclaimer box) is
+    # denser than the card around it, so canny's rect on it can out-score the
+    # full-card rect and the warp amputates the name, photo and ID strip. If a
+    # larger candidate encloses the winner and the ring between them is still
+    # printed like the inside, that ring is card, not background → take the
+    # larger one. A shadow/desk ring is smooth (fails the density test); a
+    # busy but uniform background (cloth, wood) fails the colour-spread test.
+    winner = best
+    best = _expand_past_inner_frame(best, candidates, tex, small)
     score, name, rect, area_ratio, aspect, angle = best
     (cx, cy), (rw, rh), _ = rect
     # Pad outward so a tight contour never shaves off border characters.
@@ -320,10 +410,13 @@ def detect_document_quad(img: np.ndarray,
                           (rw * (1 + 2 * pad_ratio), rh * (1 + 2 * pad_ratio)),
                           angle)) / scale
     skew = min(abs(angle), abs(abs(angle) - 90.0))
-    return quad, {"source": name, "score": round(score, 3),
-                  "area_ratio": round(area_ratio, 3),
-                  "aspect": round(aspect, 3),
-                  "angle": round(angle, 2), "skew": round(skew, 2)}
+    dbg = {"source": name, "score": round(score, 3),
+           "area_ratio": round(area_ratio, 3),
+           "aspect": round(aspect, 3),
+           "angle": round(angle, 2), "skew": round(skew, 2)}
+    if best is not winner:
+        dbg["expanded_from"] = winner[1]
+    return quad, dbg
 
 
 def crop_document(img: np.ndarray) -> tuple[np.ndarray, dict]:

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import streamlit as st
+from config import Settings
 from kyc_pipeline import DocumentPipeline
 
 # Ensure storage workspace exists
@@ -24,7 +25,8 @@ st.markdown("""
 # Cache pipeline instantiation to keep execution fast
 @st.cache_resource
 def get_pipeline():
-    return DocumentPipeline()
+    # The UI shows the masked render, so keep writing it to sample-docs/.
+    return DocumentPipeline(Settings(save_masked_output=True))
 
 pipeline = get_pipeline()
 

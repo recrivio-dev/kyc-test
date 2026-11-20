@@ -11,6 +11,7 @@ confidence 0 so the JSON shape itself stays stable.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import re
 import unicodedata
@@ -311,6 +312,10 @@ _DOB_LABEL_RX = re.compile(r"[D0O][O0][B8]|DATE\s*OF\s*BIRTH", re.I)
 _ISSUE_DATE_RX = re.compile(
     r"[I1]SSU|PR[I1L]N|D[O0]WNL|UPDAT|UPLOAD|GENERAT|VALID|EXPIR", re.I)
 _FULL_DATE_RX = re.compile(r"[0-3]?\d[/\-.][01]?\d[/\-.]\d{4}")
+# English gender word. The left edge is NOT word-bounded: OCR glues the Hindi
+# label's transliteration onto it ('tarFemale', "SRW'MALE"). FEMALE is tried
+# before MALE at each position, so 'Female' can't be read as 'MALE'.
+_GENDER_RX = re.compile(r"(FEMALE|TRANSGENDER|MALE)(?![A-Z])", re.I)
 
 
 def _is_plausible_dob(iso: str) -> bool:
@@ -341,7 +346,8 @@ def _dob_from_digits(chunk: str) -> str:
     return iso if _is_plausible_dob(iso) else ""
 
 
-def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
+def _aadhaar_dob(full_text: str,
+                 regions: Optional[List[Dict]] = None) -> Tuple[str, bool, str]:
     """Pick the date of birth from the card text.
 
     Returns ``(value, yob_only_flag, raw_matched_date)`` — ``value`` is
@@ -421,6 +427,24 @@ def _aadhaar_dob(full_text: str) -> Tuple[str, bool, str]:
         if non_issue:
             iso, raw = min(non_issue, key=lambda p: p[0])
             return iso, False, raw
+
+    # 4) a lone date whose label OCR destroyed ('9000:30/07/1995'), accepted
+    #    only by position: the front prints DOB directly above the gender
+    #    line, in the same column, and no issue/print date ever sits there.
+    genders = [r["region"].bbox for r in regions or []
+               if _GENDER_RX.search(r["text"])]
+    for raw, ctx in dates:
+        iso = _yyyy_mm_dd(raw)
+        if not _is_plausible_dob(iso) or _ISSUE_DATE_RX.search(ctx):
+            continue
+        for r in regions or []:
+            if raw not in r["text"].upper():
+                continue
+            x1, y1, _, y2 = r["region"].bbox
+            h = max(1, y2 - y1)
+            if any(0 < gy1 - y1 <= 2.5 * h and abs(gx1 - x1) <= 3 * h
+                   for gx1, gy1, _, _ in genders):
+                return iso, False, raw
     return "", False, ""
 
 
@@ -653,9 +677,17 @@ def _aadhaar_address(ordered: List[Dict], aadhaar_num: str = "") -> Tuple[
         if tail and not _is_id_number(tail):
             parts.append(tail)
             confs.append(ordered[label_idx]["conf"])
+        # The address block is left-aligned under its label. Lines starting far
+        # left or right of it belong to another panel (a front+back scan side
+        # by side, or the regional-language column) — skip, don't stop.
+        lx1, ly1, _, ly2 = ordered[label_idx]["region"].bbox
+        lh = max(1, ly2 - ly1)
         for r in ordered[label_idx + 1:]:
             t = r["text"].strip()
             if not t:
+                continue
+            rx1 = r["region"].bbox[0]
+            if rx1 < lx1 - 2 * lh or rx1 > lx1 + 6 * lh:
                 continue
             if _is_id_number(t) or _ADDR_FOOTER_RX.search(t):
                 break
@@ -746,31 +778,93 @@ def _labelled_place(segments: List[str], label_rx: re.Pattern,
     return ""
 
 
+# Relation prefix before the care-of name, OCR-tolerant:
+#   * slashed  — 'S/O', 'S/0', 'S / O', 'S\\O', 'S|O', 'S.O.'
+#   * slash lost — 'SO:' / 'S0:' (only with a colon, so a word like 'SOUTH'
+#     never matches)
+#   * spelled out — 'Son of', 'Daughter of', 'Wife of', 'Husband of', 'Care of'
+_CO_PREFIX_RX = re.compile(
+    r"(?<![A-Z])(?:([CSDWH])\s*[/\\|.]\s*[O0]\.?(?![A-Z])"
+    r"|([CSDWH])[O0]\s*[:：](?=\s*[A-Z])"
+    r"|(SON|DAUGHTER|WIFE|HUSBAND|CARE)\s+OF\b)\s*[:：.\-]?\s*",
+    re.I)
+_CO_RELATION = {"C": "care_of", "S": "father", "D": "father", "W": "husband",
+                "H": "care_of", "SON": "father", "DAUGHTER": "father",
+                "WIFE": "husband", "HUSBAND": "care_of", "CARE": "care_of"}
+
+
+def _care_of(full: str) -> Tuple[str, str]:
+    """(name, relation) printed after a C/O · S/O · D/O · W/O prefix.
+
+    The name runs until the next comma, a 'House' label or a digit (the house
+    number that usually follows). A '.' ends it unless an initial ('R. K.').
+    Returns ('', 'father') when no plausible name follows a prefix."""
+    for m in _CO_PREFIX_RX.finditer(full):
+        rest = full[m.end():]
+        val = re.split(r",|\bHOUSE\b|\bH\.?\s*NO\b|\d", rest, maxsplit=1,
+                       flags=re.I)[0]
+        val = re.split(r"\.(?!\s)", val, maxsplit=1)[0]
+        val = re.sub(r"[^A-Za-z .]", " ", val).strip(" .")
+        if sum(ch.isalpha() for ch in val) < 3:
+            continue
+        key = (m.group(1) or m.group(2) or m.group(3)).upper()
+        return _clean_name(val), _CO_RELATION.get(key, "care_of")
+    return "", "father"
+
+
+def _repair_state_names(full: str) -> str:
+    """Snap an OCR-garbled state name in the address tail to its spelling:
+    'West Sengal' -> 'West Bengal', 'UtarPradesh' -> 'Uttar Pradesh',
+    'Gjara' -> 'Gujarat'. Only the last three comma segments are considered —
+    that is where the state prints — so a person or locality name earlier in
+    the address ('Bihari Lal') is never rewritten."""
+    segs = full.split(",")
+    head, tail = segs[:-3], segs[-3:]
+    states = [(re.sub(r"[^A-Z]", "", st), st.title()) for st in _INDIAN_STATES]
+    fixed = []
+    for seg in tail:
+        toks = list(re.finditer(r"[A-Za-z]+", seg))
+        done = False
+        for n in (3, 2, 1):
+            for i in range(len(toks) - n + 1):
+                win = toks[i:i + n]
+                # Words of one name are separated by spaces only.
+                if any(seg[a.end():b.start()].strip()
+                       for a, b in zip(win, win[1:])):
+                    continue
+                key = "".join(t.group(0) for t in win).upper()
+                if len(key) < 5:
+                    continue
+                for sk, canon in states:
+                    if abs(len(key) - len(sk)) > 2 or key[0] != sk[0]:
+                        continue
+                    if difflib.SequenceMatcher(None, key, sk).ratio() >= 0.80:
+                        seg = seg[:win[0].start()] + canon + seg[win[-1].end():]
+                        done = True
+                        break
+                if done:
+                    break
+            if done:
+                break
+        fixed.append(seg)
+    return ",".join(head + fixed)
+
+
 def _assemble_address(parts: List[str], confs: List[float],
                       aadhaar_num: str = "") -> Tuple[
         str, float, str, str, str, Dict[str, str]]:
     """Join ordered address lines into the address string + sub-components."""
-    full = ", ".join(parts).strip(" ,")
+    # Fullwidth punctuation ('（', '，', '：') -> ASCII.
+    full = unicodedata.normalize("NFKC", ", ".join(parts)).strip(" ,")
     full = re.sub(r"(?:\s*,\s*)+", ", ", full).strip(" ,")
     full = re.sub(r"\s+", " ", full)
+    full = _repair_state_names(full)
 
     zipm = re.search(r"\b(\d{6})\b", full)
     pin = zipm.group(1) if zipm else ""
 
     # care_of: relation depends on which prefix appeared (C/O vs S/O vs W/O).
-    co_match = re.search(
-        r"(C/O|S/O|D/O|W/O)[:\s]*([A-Za-z][A-Za-z\s]+?)(?:,|House|$)",
-        full, re.I,
-    )
-    care_of = ""
-    care_of_relation = "father"      # sensible default for empty case
-    if co_match:
-        care_of = _clean_name(co_match.group(2))
-        prefix = co_match.group(1).upper()
-        care_of_relation = {
-            "C/O": "care_of", "S/O": "father",
-            "D/O": "father",  "W/O": "husband",
-        }.get(prefix, "care_of")
+    care_of, care_of_relation = _care_of(full)
 
     # ── sub-components — best-effort ──
     components: Dict[str, str] = {
@@ -833,12 +927,12 @@ def build_aadhaar(regions: List[Dict], full_text: str) -> Dict[str, Any]:
 
     # _aadhaar_dob returns the raw matched date so the confidence lookup lands
     # on the real birth-date region, not a stray print/issue date.
-    dob_val, yob_only, dob_raw = _aadhaar_dob(full_text)
+    dob_val, yob_only, dob_raw = _aadhaar_dob(full_text, regions)
     dob_conf = _conf_for(regions, dob_raw) if dob_raw else 0.0
 
     gender = ""
     g_conf = 0.0
-    gm = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", full_text, re.I)
+    gm = _GENDER_RX.search(full_text)
     if gm:
         gender = {"male": "M", "female": "F",
                   "transgender": "T"}[gm.group(1).lower()]

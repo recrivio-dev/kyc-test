@@ -16,6 +16,11 @@ Per-document-type endpoints (no ``doc_type`` form field needed):
     POST /api/v1/ocr/voter-id
     POST /api/v1/ocr/driving-license
 
+Full-page OCR of selected PDF pages (no ID-card crop/classify/mask):
+
+    curl -F "file=@report.pdf" -F "pages=4,5" \\
+         http://127.0.0.1:8000/api/v1/ocr/pdf-pages
+
 The response body is exactly the contract documented in
 ``output_schema.py`` — i.e. the same JSON that the Streamlit UI displays.
 
@@ -28,10 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 import tempfile
-from typing import Literal, Optional
+from typing import AsyncIterator, Literal, Optional
 
 import cv2
 import numpy as np
@@ -39,10 +45,17 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from kyc_pipeline import DocumentPipeline
+from config import _env_int
+from kyc_pipeline import DocumentLoadError, DocumentPipeline
 from liveness.router import models_on_disk
 from liveness.router import router as liveness_router
 from output_schema import failure_envelope, success_envelope
+from pdf_pages import PdfPagesError, parse_page_list, read_pdf_pages
+
+log = logging.getLogger("uvicorn.error")
+
+# Uploads larger than this are rejected with 413 before any decoding.
+MAX_UPLOAD_BYTES = _env_int("KYC_MAX_UPLOAD_MB", 25) * 1024 * 1024
 
 DocType = Literal["PAN", "AADHAAR", "PASSPORT", "VOTER_ID", "DRIVING_LICENSE"]
 
@@ -57,7 +70,13 @@ _MASK_DOC_MAP = {
     "driving-license": "DRIVING_LICENSE",
 }
 
-app = FastAPI(title="Recrivio KYC OCR", version="1.0.0")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await _warmup()
+    yield
+
+
+app = FastAPI(title="Recrivio KYC OCR", version="1.0.0", lifespan=_lifespan)
 
 # Permissive CORS for the frontend — tighten this in production.
 app.add_middleware(
@@ -71,6 +90,17 @@ app.include_router(liveness_router)
 
 # One pipeline instance for the process lifetime — the OCR models load once.
 _pipeline = DocumentPipeline()
+
+# Masking runs in the background for the caller, but it is as CPU-heavy as an
+# extraction and shares the same cores. Cap how many run at once per worker so
+# a burst of mask jobs can't queue user-facing extractions behind them.
+_mask_slots = asyncio.Semaphore(max(1, _env_int("KYC_MASK_CONCURRENCY", 1)))
+
+# Full-page reads are several times the work of a card read (an A4 page at
+# ~180 dpi, per page). Same reasoning as masking: cap them per worker so
+# they can't starve user-facing KYC extractions.
+_pdf_pages_slots = asyncio.Semaphore(
+    max(1, _env_int("KYC_PDF_PAGES_CONCURRENCY", 1)))
 
 # Deep-readiness state. `/healthz` returns 200 only when the models are loaded
 # AND a startup self-test drove a document through the ENTIRE pipeline without
@@ -146,7 +176,6 @@ def _selftest_image() -> "np.ndarray":
     return img
 
 
-@app.on_event("startup")
 async def _warmup() -> None:
     global _selftest_ok, _selftest_error
     _pipeline._ensure_ocr()
@@ -161,8 +190,8 @@ async def _warmup() -> None:
     except Exception as exc:  # any failure ⇒ not ready
         _selftest_ok = False
         _selftest_error = f"{type(exc).__name__}: {exc}"
-        logging.getLogger("uvicorn.error").error(
-            "OCR startup self-test FAILED — reporting unhealthy: %s", _selftest_error)
+        log.error("OCR startup self-test FAILED — reporting unhealthy: %s",
+                  _selftest_error)
     finally:
         try:
             os.remove(path)
@@ -202,19 +231,59 @@ def healthz():
     )
 
 
-async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
+class _UploadError(Exception):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+@contextlib.asynccontextmanager
+async def _upload_to_tempfile(file: UploadFile) -> AsyncIterator[str]:
+    """Spool the upload to a temp file (the pipeline reads by path so cv2 can
+    honour EXIF orientation / pdfium can open PDFs) and always delete it."""
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not data:
+        raise _UploadError("Empty file", 400)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise _UploadError(
+            f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB", 413)
     suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
     fd, path = tempfile.mkstemp(suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(await file.read())
-
-        result = await _pipeline.process_and_verify(path, doc_type.upper())
+            f.write(data)
+        yield path
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(path)
-        except OSError:
-            pass
+
+
+def _error(message: str, status: int) -> JSONResponse:
+    return JSONResponse(content=failure_envelope(message, status=status),
+                        status_code=status)
+
+
+async def _guarded(coro_fn, file: UploadFile, *args):
+    """Run a pipeline entry point on the uploaded file, mapping bad input to
+    4xx and anything unexpected to a logged 500 in the standard envelope
+    (instead of FastAPI's bare-text 500)."""
+    try:
+        async with _upload_to_tempfile(file) as path:
+            return await coro_fn(path, *args)
+    except _UploadError as e:
+        return _error(str(e), e.status)
+    except DocumentLoadError as e:        # undecodable image / PDF
+        return _error(str(e), 422)
+    except Exception:
+        log.exception("pipeline failed")
+        return _error("Internal error while processing the document", 500)
+
+
+async def _run_pipeline(file: UploadFile, doc_type: str) -> JSONResponse:
+    result = await _guarded(_pipeline.process_and_verify, file,
+                            doc_type.upper())
+    if isinstance(result, JSONResponse):
+        return result
 
     payload = result.get("output_json")
     if payload is None:
@@ -287,17 +356,10 @@ async def mask_identity_endpoint(
             status_code=400,
         )
 
-    suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(await file.read())
-        result = await _pipeline.mask_identity(path, internal)
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    async with _mask_slots:
+        result = await _guarded(_pipeline.mask_identity, file, internal)
+    if isinstance(result, JSONResponse):
+        return result
 
     # Document couldn't be processed at all ⇒ failure (bad type / OCR down /
     # encode error). 4xx = permanent (don't retry), 5xx = transient.
@@ -325,3 +387,41 @@ async def mask_identity_endpoint(
         "client_id": client_id,
     }
     return JSONResponse(content=success_envelope(data), status_code=200)
+
+
+@app.post("/api/v1/ocr/pdf-pages")
+async def pdf_pages_endpoint(
+    file: UploadFile = File(...),
+    pages: str = Form(...),
+):
+    """OCR whole PDF pages as they are — for report pages whose content is
+    an embedded image (e.g. CIBIL pages inside a credit report).
+
+    ``pages`` is a comma-separated, 1-based list (``"4,5"``), at most
+    ``KYC_PDF_PAGES_MAX`` per call. Returns every recognised line with its
+    confidence (0..1) and ``[x1, y1, x2, y2]`` box in the rendered page's
+    pixel space. The text is not interpreted here: the caller parses it and
+    decides which confidences to trust."""
+    try:
+        page_list = parse_page_list(pages)
+    except PdfPagesError as e:
+        return _error(str(e), e.status)
+    if not (file.filename or "").lower().endswith(".pdf"):
+        return _error("Only PDF files are supported", 415)
+
+    _pipeline._ensure_ocr()
+    if _pipeline.primary_ocr is None:
+        return _error("OCR engine unavailable", 503)
+
+    async def _read(path: str):
+        # Bad PDF / out-of-range page is the caller's input error, not a 500.
+        try:
+            return await read_pdf_pages(path, page_list, _pipeline.primary_ocr)
+        except PdfPagesError as e:
+            return _error(str(e), e.status)
+
+    async with _pdf_pages_slots:
+        result = await _guarded(_read, file)
+    if isinstance(result, JSONResponse):
+        return result
+    return JSONResponse(content=success_envelope(result), status_code=200)

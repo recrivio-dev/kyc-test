@@ -16,6 +16,11 @@ Per-document-type endpoints (no ``doc_type`` form field needed):
     POST /api/v1/ocr/voter-id
     POST /api/v1/ocr/driving-license
 
+Full-page OCR of selected PDF pages (no ID-card crop/classify/mask):
+
+    curl -F "file=@report.pdf" -F "pages=4,5" \\
+         http://127.0.0.1:8000/api/v1/ocr/pdf-pages
+
 The response body is exactly the contract documented in
 ``output_schema.py`` — i.e. the same JSON that the Streamlit UI displays.
 """
@@ -38,6 +43,7 @@ from fastapi.responses import JSONResponse
 from config import _env_int
 from kyc_pipeline import DocumentLoadError, DocumentPipeline
 from output_schema import failure_envelope, success_envelope
+from pdf_pages import PdfPagesError, parse_page_list, read_pdf_pages
 
 log = logging.getLogger("uvicorn.error")
 
@@ -80,6 +86,12 @@ _pipeline = DocumentPipeline()
 # extraction and shares the same cores. Cap how many run at once per worker so
 # a burst of mask jobs can't queue user-facing extractions behind them.
 _mask_slots = asyncio.Semaphore(max(1, _env_int("KYC_MASK_CONCURRENCY", 1)))
+
+# Full-page reads are several times the work of a card read (an A4 page at
+# ~180 dpi, per page). Same reasoning as masking: cap them per worker so
+# they can't starve user-facing KYC extractions.
+_pdf_pages_slots = asyncio.Semaphore(
+    max(1, _env_int("KYC_PDF_PAGES_CONCURRENCY", 1)))
 
 # Deep-readiness state. `/healthz` returns 200 only when the models are loaded
 # AND a startup self-test drove a document through the ENTIRE pipeline without
@@ -306,3 +318,41 @@ async def mask_identity_endpoint(
         "client_id": client_id,
     }
     return JSONResponse(content=success_envelope(data), status_code=200)
+
+
+@app.post("/api/v1/ocr/pdf-pages")
+async def pdf_pages_endpoint(
+    file: UploadFile = File(...),
+    pages: str = Form(...),
+):
+    """OCR whole PDF pages as they are — for report pages whose content is
+    an embedded image (e.g. CIBIL pages inside a credit report).
+
+    ``pages`` is a comma-separated, 1-based list (``"4,5"``), at most
+    ``KYC_PDF_PAGES_MAX`` per call. Returns every recognised line with its
+    confidence (0..1) and ``[x1, y1, x2, y2]`` box in the rendered page's
+    pixel space. The text is not interpreted here: the caller parses it and
+    decides which confidences to trust."""
+    try:
+        page_list = parse_page_list(pages)
+    except PdfPagesError as e:
+        return _error(str(e), e.status)
+    if not (file.filename or "").lower().endswith(".pdf"):
+        return _error("Only PDF files are supported", 415)
+
+    _pipeline._ensure_ocr()
+    if _pipeline.primary_ocr is None:
+        return _error("OCR engine unavailable", 503)
+
+    async def _read(path: str):
+        # Bad PDF / out-of-range page is the caller's input error, not a 500.
+        try:
+            return await read_pdf_pages(path, page_list, _pipeline.primary_ocr)
+        except PdfPagesError as e:
+            return _error(str(e), e.status)
+
+    async with _pdf_pages_slots:
+        result = await _guarded(_read, file)
+    if isinstance(result, JSONResponse):
+        return result
+    return JSONResponse(content=success_envelope(result), status_code=200)
